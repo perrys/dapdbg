@@ -17,10 +17,13 @@
 ;; intended to be used for direct communication with native debuggers such as
 ;; GDB (since version 14) and LLDB.
 ;;
-;; The following is a fairly minimal implementation of the DAP for this
-;; specialized use-case; it runs the debugger as a sub-process and communicates
-;; with it in single request/response mode. It does not support multiple
-;; sessions, socket connections and so forth; for a generalized DAP
+;; The following is a fairly minimal implementation of the DAP for this narrow
+;; use-case; it runs the debugger as a sub-process and communicates with it in
+;; single request/response mode.
+;;
+;; This implementation specifically supports native-debugging features such as
+;; instruction-level stepping and disassembly/memory views. It does not support
+;; multiple sessions, socket connections and so forth; for a generalized DAP
 ;; implementation supporting multiple scripting and native languages, see
 ;; [dap-mode](https://emacs-lsp.github.io/dap-mode/).
 ;;
@@ -31,7 +34,7 @@
 
 (require 'json)
 
-(defvar dapdbg-lldb-command-line '("lldb-dap")
+(defvar dapdbg-lldb-command-line '("lldb-dap-18")
   "Command-line to invoke the lldb debugger process.
 
 The LLDB debugger ships with a separate binary for the DAP server
@@ -42,10 +45,67 @@ called 'lldb-dap' since version 18.")
   "Command-line to invoke the gdb debugger process.
 
 The GDB debugger implements the DAP interface with the
-command-line flags '-i dap'")
+command-line flags '-i dap'. Note that GDB supports DAP from
+version 14 onwards.")
 
 (defvar dapdbg-launch-args nil 
   "Additional properties to pass to the launch command (debugger dependent).")
+
+(defun dapdbg-quit ()
+  "Shut down and disconnect from the currently running DAP server (if any)."
+  (interactive)
+  (if (process-live-p dapdbg--process)
+      (kill-process dapdbg--process)))
+
+(defun dapdbg-start-lldb (program &optional program-arguments)
+  (interactive "fProgram to launch: \nsProgram arguments: ")
+  (dapdbg--start program program-arguments dapdbg--lldb-plist))
+
+(defun dapdbg-start-gdb (program &optional program-arguments)
+  (interactive "fProgram to launch: \nsProgram arguments: ")
+  (dapdbg--start program program-arguments dapdbg--gdb-plist))
+
+(defun dapdbg--start (program program-arguments debugger-plist)
+  (when (process-live-p dapdbg--process)
+    (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
+      ("y" (dapdbg-quit))
+      (_ (error "Aborted"))))
+  (dapdbg--connect (eval (plist-get debugger-plist :command-line-sym)))
+  
+  (let ((arguments (list
+               :name (file-name-nondirectory program)
+               :type (plist-get debugger-plist :type)
+               :request "launch"
+               :program (expand-file-name program)
+               (plist-get debugger-plist :stop-on-entry-sym) t)))
+    (when (not (string-empty-p program-arguments))
+      (let ((tokens (string-split program-arguments)))
+        (plist-put arguments :args tokens))) 
+    (put 'dapdbg--process 'launch-args arguments)
+    (dapdbg--initialize)))
+
+(defun dapdbg-continue ()
+  (interactive)
+  (dapdbg--send-request "continue"
+                        (list :threadId (get 'dapdbg--process :thread-id))))
+
+(defun dapdbg-set-breakpoint (&optional filename line)
+  (interactive)
+  (unless filename
+    (setq filename (expand-file-name (buffer-file-name))))
+  (unless line
+    (setq line (line-number-at-pos)))
+  (dapdbg--send-request "setBreakpoints"
+                        (list :source (list :name (file-name-nondirectory filename) :path filename)
+                              :breakpoints (vector (list :line line)))))
+
+(defun dapdbg-stacktrace (&optional thread-id)
+  (interactive)
+  (let ((tid thread-id))
+    (unless tid
+      (setq tid (get 'dapdbg--process 'thread-id)))
+    (dapdbg--send-request "stackTrace"
+                          (list :threadId tid))))
 
 (defface dapdbg-request-face
   '((((class color)) :foreground "Green")
@@ -74,71 +134,13 @@ command-line flags '-i dap'")
 
 (defconst dapdbg--lldb-plist
   (list :type "lldb-dap"
-        :command-line-sym 'dapdbg-gdb-command-line
-        :launch-args-sym :arguments
+        :command-line-sym 'dapdbg-lldb-command-line
         :stop-on-entry-sym :stopOnEntry))
 
 (defconst dapdbg--gdb-plist
   (list :type "gdb-dap"
         :command-line-sym 'dapdbg-gdb-command-line
-        :launch-args-sym :args
         :stop-on-entry-sym :stopAtBeginningOfMainSubprogram))
-
-(defun dapdbg-quit ()
-  "Shut down and disconnect from the currently running DAP server (if any)."
-  (interactive)
-  (if (process-live-p dapdbg--process)
-      (kill-process dapdbg--process)))
-
-(defun dapdbg-start-lldb (program &optional program-arguments)
-  (interactive "fProgram to launch: \nsProgram arguments: ")
-  (dapdbg--start program program-arguments dapdbg--lldb-plist))
-
-(defun dapdbg-start-gdb (program &optional program-arguments)
-  (interactive "fProgram to launch: \nsProgram arguments: ")
-  (dapdbg--start program program-arguments dapdbg--gdb-plist))
-
-(defun dapdbg--start (program program-arguments debugger-plist)
-  (when (process-live-p dapdbg--process)
-    (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
-      ("y" (dapdbg-disconnect))
-      (_ (error "Aborted"))))
-  (dapdbg--connect (eval (plist-get debugger-plist :command-line-sym)))
-  
-  (let ((args (list
-               :name (file-name-nondirectory program)
-               :type (plist-get debugger-plist :type)
-               :request "launch"
-               :program (expand-file-name program)
-               (plist-get debugger-plist :stop-on-entry-sym) t)))
-    (when (not (string-empty-p program-arguments))
-      (let ((tokens (string-split program-arguments)))
-        (plist-put args (plist-get debugger-plist :launch-args-sym) tokens))) 
-    (put 'dapdbg--process 'launch-args args)
-    (dapdbg--initialize)))
-
-(defun dapdbg-continue ()
-  (interactive)
-  (dapdbg--send-request "continue"
-                        (list :threadId (get 'dapdbg--process :thread-id))))
-
-(defun dapdbg-set-breakpoint (&optional filename line)
-  (interactive)
-  (unless filename
-    (setq filename (expand-file-name (buffer-file-name))))
-  (unless line
-    (setq line (line-number-at-pos)))
-  (dapdbg--send-request "setBreakpoints"
-                        (list :source (list :name (file-name-nondirectory filename) :path filename)
-                              :breakpoints (vector (list :line line)))))
-
-(defun dapdbg-stacktrace (&optional thread-id)
-  (interactive)
-  (let ((tid thread-id))
-    (unless tid
-      (setq tid (get 'dapdbg--process 'thread-id)))
-    (dapdbg--send-request "stackTrace"
-                          (list :threadId tid))))
 
 (defun dapdbg--enrich-process-symbol ()
   (put 'dapdbg--process 'callbacks (make-hash-table))
