@@ -31,18 +31,31 @@
 
 (require 'json)
 
-(defvar dapdbg-command '("lldb-dap-18")
-  "Command-line to invoke the debugger process.
+(defvar dapdbg-lldb-command-line '("lldb-dap")
+  "Command-line to invoke the lldb debugger process.
 
 The LLDB debugger ships with a separate binary for the DAP server
 - on older versions this is called 'lldb-vscode', and it is
-called 'lldb-dap' since version 18.
+called 'lldb-dap' since version 18.")
 
-The GDB debugger implements this feature with the command-line
-flags '-i dap'")
+(defvar dapdbg-gdb-command-line '("gdb" "-i" "dap")
+  "Command-line to invoke the gdb debugger process.
 
-(defvar dapdbg-launch-args '("lldb-dap-18")
-  "Command-line to invoke the debugger process.")
+The GDB debugger implements the DAP interface with the
+command-line flags '-i dap'")
+
+(defvar dapdbg-launch-args nil 
+  "Additional properties to pass to the launch command (debugger dependent).")
+
+(defface dapdbg-request-face
+  '((((class color)) :foreground "Green")
+    (t :weight bold))
+  "Face for requests to the DAP server")
+
+(defface dapdbg-response-face
+  '((((class color)) :foreground "Cyan")
+    (t :slant italic))
+  "Face for responses from the DAP server")
 
 (defvar dapdbg--source-breakpoints nil
   "List of source-code breakpoints for current or future debugging sessions.
@@ -59,45 +72,48 @@ flags '-i dap'")
   "Enables output of request & response messages to/from the DAP
    server (only useful for debugging this package)")
 
-(defvar dapdbg--stopped-hook nil
-  "Functions to call when the debugger sends a 'stopped' event")
+(defconst dapdbg--lldb-plist
+  (list :type "lldb-dap"
+        :command-line-sym 'dapdbg-gdb-command-line
+        :launch-args-sym :arguments
+        :stop-on-entry-sym :stopOnEntry))
 
-(defface dapdbg-request-face
-  '((((class color)) :foreground "Green")
-    (t :weight bold))
-  "Face for requests to the DAP server")
+(defconst dapdbg--gdb-plist
+  (list :type "gdb-dap"
+        :command-line-sym 'dapdbg-gdb-command-line
+        :launch-args-sym :args
+        :stop-on-entry-sym :stopAtBeginningOfMainSubprogram))
 
-(defface dapdbg-response-face
-  '((((class color)) :foreground "Cyan")
-    (t :slant italic))
-  "Face for responses from the DAP server")
-
-(defvar dapdbg--process nil
-  "Global (could be directory-local) variable holding the debugger process")
-
-(defun dapdbg-disconnect ()
+(defun dapdbg-quit ()
   "Shut down and disconnect from the currently running DAP server (if any)."
   (interactive)
   (if (process-live-p dapdbg--process)
       (kill-process dapdbg--process)))
 
-(defun dapdbg-launch (program &optional program-arguments)
+(defun dapdbg-start-lldb (program &optional program-arguments)
   (interactive "fProgram to launch: \nsProgram arguments: ")
+  (dapdbg--start program program-arguments dapdbg--lldb-plist))
+
+(defun dapdbg-start-gdb (program &optional program-arguments)
+  (interactive "fProgram to launch: \nsProgram arguments: ")
+  (dapdbg--start program program-arguments dapdbg--gdb-plist))
+
+(defun dapdbg--start (program program-arguments debugger-plist)
   (when (process-live-p dapdbg--process)
     (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
       ("y" (dapdbg-disconnect))
       (_ (error "Aborted"))))
-  (dapdbg--connect)
+  (dapdbg--connect (eval (plist-get debugger-plist :command-line-sym)))
   
   (let ((args (list
                :name (file-name-nondirectory program)
-               :type "lldb-dap"
+               :type (plist-get debugger-plist :type)
                :request "launch"
                :program (expand-file-name program)
-               :stopOnEntry t)))
+               (plist-get debugger-plist :stop-on-entry-sym) t)))
     (when (not (string-empty-p program-arguments))
       (let ((tokens (string-split program-arguments)))
-        (plist-put args :arguments tokens))) 
+        (plist-put args (plist-get debugger-plist :launch-args-sym) tokens))) 
     (put 'dapdbg--process 'launch-args args)
     (dapdbg--initialize)))
 
@@ -116,16 +132,24 @@ flags '-i dap'")
                         (list :source (list :name (file-name-nondirectory filename) :path filename)
                               :breakpoints (vector (list :line line)))))
 
+(defun dapdbg-stacktrace (&optional thread-id)
+  (interactive)
+  (let ((tid thread-id))
+    (unless tid
+      (setq tid (get 'dapdbg--process 'thread-id)))
+    (dapdbg--send-request "stackTrace"
+                          (list :threadId tid))))
+
 (defun dapdbg--enrich-process-symbol ()
   (put 'dapdbg--process 'callbacks (make-hash-table))
   (put 'dapdbg--process 'seq 1))
 
-(defun dapdbg--connect ()
+(defun dapdbg--connect (command-line)
   (setq dapdbg--process (make-process
                          :name "scp/debug-session"
                          :connection-type 'pipe
                          :coding 'no-conversion
-                         :command dapdbg-command
+                         :command command-line
                          :stderr "*debugger stderr*"
                          :filter #'dapdbg--handle-message
                          :noquery t))
@@ -143,7 +167,7 @@ flags '-i dap'")
         (error "Debugger does not have capability \"%s\"" cap)))
     (put 'dapdbg--process 'capabilites caps))
   (let ((args (get 'dapdbg--process 'launch-args)))
-    (dapdbg--set-all-breakpoints)
+                                        ;(dapdbg--set-all-breakpoints)
     (dapdbg--send-request "launch" args nil t)))
 
 (defun dapdbg--initialize ()
@@ -178,13 +202,33 @@ flags '-i dap'")
       (remhash cb-seq cb-table)
       (funcall cb parsed-msg))))
 
+(defvar dapdbg--stopped-callback-list nil
+  "Functions to call when the debugger sends a 'stopped' event. The
+   callbacks receive the event message (i.e. this is an abnormal
+   hook).")
+
+(defvar dapdbg--continued-callback-list nil
+  "Functions to call when the debugger sends a 'continued' event.")
+
+(defvar dapdbg--output-callback-list nil
+  "Functions to call when the debugger sends an 'output' event.")
+
+(defvar dapdbg--thread-callback-list nil
+  "Functions to call when the debugger sends an 'thread' event.")
+
+(defvar dapdbg--process nil
+  "Global (could be directory-local) variable holding the debugger process")
+
 (defun dapdbg--handle-event (parsed-msg)
   (pcase (gethash "event" parsed-msg)
     ("initialized"
      (dapdbg--send-request "configurationDone" nil #'dapdbg--handle-response-configdone t))
     ("stopped"
-     (dolist (fn dapdbg--stopped-hook)
-       (funcall fn parsed-msg)))
+     (dapdbg--handle-event-stopped parsed-msg)
+     (run-hook-with-args dapdbg--stopped-callback-list parsed-msg))
+    ("continued" (run-hook-with-args dapdbg--continued-callback-list parsed-msg))
+    ("output" (run-hook-with-args dapdbg--output-callback-list parsed-msg))
+    ("thread" (run-hook-with-args dapdbg--thread-callback-list parsed-msg))
     (`,an-event (message "event: %s" an-event))))
 
 (defun dapdbg--handle-message (_process msg)
