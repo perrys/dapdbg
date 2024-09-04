@@ -54,8 +54,10 @@ version 14 onwards.")
 (defun dapdbg-quit ()
   "Shut down and disconnect from the currently running DAP server (if any)."
   (interactive)
-  (if (process-live-p dapdbg--process)
-      (kill-process dapdbg--process)))
+  (if dapdbg--ssn
+      (let ((proc (dapdbg-session-process dapdbg--ssn)))
+        (if (process-live-p proc)
+            (kill-process proc)))))
 
 (defun dapdbg-start-lldb (program &optional program-arguments)
   (interactive "fProgram to launch: \nsProgram arguments: ")
@@ -65,29 +67,10 @@ version 14 onwards.")
   (interactive "fProgram to launch: \nsProgram arguments: ")
   (dapdbg--start program program-arguments dapdbg--gdb-plist))
 
-(defun dapdbg--start (program program-arguments debugger-plist)
-  (when (process-live-p dapdbg--process)
-    (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
-      ("y" (dapdbg-quit))
-      (_ (error "Aborted"))))
-  (dapdbg--connect (eval (plist-get debugger-plist :command-line-sym)))
-  
-  (let ((arguments (list
-               :name (file-name-nondirectory program)
-               :type (plist-get debugger-plist :type)
-               :request "launch"
-               :program (expand-file-name program)
-               (plist-get debugger-plist :stop-on-entry-sym) t)))
-    (when (not (string-empty-p program-arguments))
-      (let ((tokens (string-split program-arguments)))
-        (plist-put arguments :args tokens))) 
-    (put 'dapdbg--process 'launch-args arguments)
-    (dapdbg--initialize)))
-
 (defun dapdbg-continue ()
   (interactive)
   (dapdbg--send-request "continue"
-                        (list :threadId (get 'dapdbg--process :thread-id))))
+                        (list :threadId (dapdbg-session-thread-id dapdbg--ssn))))
 
 (defun dapdbg-set-breakpoint (&optional filename line)
   (interactive)
@@ -103,19 +86,30 @@ version 14 onwards.")
   (interactive)
   (let ((tid thread-id))
     (unless tid
-      (setq tid (get 'dapdbg--process 'thread-id)))
+      (setq tid (dapdbg-session-thread-id dapdbg--ssn)))
     (dapdbg--send-request "stackTrace"
                           (list :threadId tid))))
 
 (defface dapdbg-request-face
-  '((((class color)) :foreground "Green")
-    (t :weight bold))
+  '((t :inherit (warning)))
   "Face for requests to the DAP server")
 
 (defface dapdbg-response-face
-  '((((class color)) :foreground "Cyan")
-    (t :slant italic))
+  '((t :inherit (success)))
   "Face for responses from the DAP server")
+
+(cl-defstruct dapdbg-session
+  (process nil :read-only t)
+  (callbacks (make-hash-table :test 'equal) :read-only t)
+  (buffer "")
+  (seq 0)
+  (thread-id nil)
+  (launch-args nil)
+  (config-done nil)
+  (capabilites nil))
+
+(defvar dapdbg--ssn nil
+  "The global session object (only one session is allowed)")
 
 (defvar dapdbg--source-breakpoints nil
   "List of source-code breakpoints for current or future debugging sessions.
@@ -128,9 +122,10 @@ version 14 onwards.")
    BREAKPOINTS is a list of plists which have the form given in
    https://microsoft.github.io/debug-adapter-protocol/specification#Types_SourceBreakpoint")
 
-(defvar dapdbg-io-print-flag nil
+(defcustom dapdbg-io-print-flag nil
   "Enables output of request & response messages to/from the DAP
-   server (only useful for debugging this package)")
+   server (only useful for debugging this package)"
+  :type 'boolean)
 
 (defconst dapdbg--lldb-plist
   (list :type "lldb-dap"
@@ -142,37 +137,34 @@ version 14 onwards.")
         :command-line-sym 'dapdbg-gdb-command-line
         :stop-on-entry-sym :stopAtBeginningOfMainSubprogram))
 
-(defun dapdbg--enrich-process-symbol ()
-  (put 'dapdbg--process 'callbacks (make-hash-table))
-  (put 'dapdbg--process 'seq 1))
 
 (defun dapdbg--connect (command-line)
-  (setq dapdbg--process (make-process
-                         :name "scp/debug-session"
-                         :connection-type 'pipe
-                         :coding 'no-conversion
-                         :command command-line
-                         :stderr "*debugger stderr*"
-                         :filter #'dapdbg--handle-message
-                         :noquery t))
-  (dapdbg--enrich-process-symbol))
+  (let ((proc (make-process
+               :name "dapdbg-session"
+               :connection-type 'pipe
+               :coding 'no-conversion
+               :command '("lldb-dap-18");;command-line
+               :stderr "*debugger stderr*"
+               :filter #'dapdbg--handle-message
+               :noquery t)))
+    (setq dapdbg--ssn (make-dapdbg-session :process proc))))
 
-(defun dapdbg--ready-p ()
-  (and (process-live-p dapdbg--process)
-       (get 'dapdbg--process 'config-done)))
-
-(defun dapdbg--handle-initialize-response (msg)
-  (let ((caps (gethash "body" msg)))
-    (dolist (cap '("supportsConditionalBreakpoints" "supportsConfigurationDoneRequest" "supportsDisassembleRequest"))
-      (unless (gethash cap caps)
-        (dapdbg-disconnect)
-        (error "Debugger does not have capability \"%s\"" cap)))
-    (put 'dapdbg--process 'capabilites caps))
-  (let ((args (get 'dapdbg--process 'launch-args)))
-                                        ;(dapdbg--set-all-breakpoints)
-    (dapdbg--send-request "launch" args nil t)))
-
-(defun dapdbg--initialize ()
+(defun dapdbg--start (program program-arguments debugger-plist)
+  (when (and dapdbg--ssn (process-live-p (dapdbg-session-process dapdbg--ssn)))
+    (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
+      ("y" (dapdbg-quit))
+      (_ (error "Aborted"))))
+  (dapdbg--connect (eval (plist-get debugger-plist :command-line-sym)))
+  (let ((arguments (list
+                    :name (file-name-nondirectory program)
+                    :type (plist-get debugger-plist :type)
+                    :request "launch"
+                    :program (expand-file-name program)
+                    (plist-get debugger-plist :stop-on-entry-sym) t)))
+    (when (not (string-empty-p program-arguments))
+      (let ((tokens (string-split program-arguments)))
+        (plist-put arguments :args tokens))) 
+    (setf (dapdbg-session-launch-args dapdbg--ssn) arguments))
   (let ((args (list
                :clientID "dapdbg"
                :clientName "dapdbg"
@@ -186,19 +178,33 @@ version 14 onwards.")
                :locale "en-us")))
     (dapdbg--send-request "initialize" args #'dapdbg--handle-initialize-response t)))
 
-(defun dapdbg--callbacks ()
-  (get 'dapdbg--process 'callbacks))
+(defun dapdbg--ready-p ()
+  (and dapdbg--ssn
+       (process-live-p (dapdbg-session-process dapdbg--ssn))
+       (dapdbg-session-config-done dapdbg--ssn)))
+
+(defun dapdbg--handle-initialize-response (msg)
+  (let ((caps (gethash "body" msg)))
+    (dolist (cap '("supportsConditionalBreakpoints" "supportsConfigurationDoneRequest" "supportsDisassembleRequest"))
+      (unless (gethash cap caps)
+        (dapdbg-disconnect)
+        (error "Debugger does not have capability \"%s\"" cap)))
+    (setf (dapdbg-session-capabilites dapdbg--ssn) caps))
+  (let ((args (dapdbg-session-launch-args dapdbg--ssn)))
+                                        ;(dapdbg--set-all-breakpoints)
+    (dapdbg--send-request "launch" args nil t)))
+
 
 (defun dapdbg--handle-response-configdone (msg)
-  (put 'dapdbg--process 'config-done t))
+  (setf (dapdbg-session-config-done dapdbg--ssn) t))
 
 (defun dapdbg--handle-event-stopped (msg)
   (let ((tid (gethash "threadId" (gethash "body" msg))))
-    (put 'dapdbg--process 'thread-id tid)))
+    (setf (dapdbg-session-thread-id dapdbg--ssn) tid)))
 
 (defun dapdbg--handle-response (parsed-msg)
   (let* ((cb-seq (gethash "request_seq" parsed-msg))
-         (cb-table (dapdbg--callbacks))
+         (cb-table (dapdbg-session-callbacks dapdbg--ssn))
          (cb (gethash cb-seq cb-table)))
     (when cb
       (remhash cb-seq cb-table)
@@ -218,9 +224,6 @@ version 14 onwards.")
 (defvar dapdbg--thread-callback-list nil
   "Functions to call when the debugger sends an 'thread' event.")
 
-(defvar dapdbg--process nil
-  "Global (could be directory-local) variable holding the debugger process")
-
 (defun dapdbg--handle-event (parsed-msg)
   (pcase (gethash "event" parsed-msg)
     ("initialized"
@@ -234,21 +237,23 @@ version 14 onwards.")
     (`,an-event (message "event: %s" an-event))))
 
 (defun dapdbg--handle-message (_process msg)
+  (message "len: %d %s" (length msg) msg)
   (let ((remaining msg)
         (chunks (list)))
     (while (not (string-empty-p remaining))
       (pcase-let ((`(:parsed-length ,length :parsed-msg ,parsed-msg) (dapdbg--parse-message remaining)))
-        (pcase (gethash "type" parsed-msg)
-          ("event" (dapdbg--handle-event parsed-msg))
-          ("response" (dapdbg--handle-response parsed-msg))
-          (`,something (error "unrecognized message type %s" something)))
-        (add-to-list 'chunks length)
+        (if parsed-msg
+            (pcase (gethash "type" parsed-msg)
+              ("event" (dapdbg--handle-event parsed-msg))
+              ("response" (dapdbg--handle-response parsed-msg))
+              (`,something (message "unrecognized message type %s" something)))
+          (add-to-list 'chunks length))
         (setq remaining (substring remaining length))))
     (reverse chunks)))
 
 (defun dapdbg--seq-and-inc ()
-  (let ((seq-value (get 'dapdbg--process 'seq)))
-    (put 'dapdbg--process 'seq (1+ seq-value))
+  (let ((seq-value (dapdbg-session-seq dapdbg--ssn)))
+    (setf (dapdbg-session-seq dapdbg--ssn) (1+ seq-value))
     seq-value))
 
 (defun dapdbg--base-protocol (msg-plist seq)
@@ -271,7 +276,7 @@ version 14 onwards.")
     (dapdbg--base-protocol request-plist seq)))
 
 (defun dapdbg--register-callback (seq callback)
-  (puthash seq callback (dapdbg--callbacks)))
+  (puthash seq callback (dapdbg-session-callbacks dapdbg--ssn)))
 
 (defun dapdbg--send-request (command &optional args callback skip-ready-check)
   (unless (or skip-ready-check (dapdbg--ready-p))
@@ -280,7 +285,7 @@ version 14 onwards.")
     (dapdbg--io-message hdrs body t)
     (if callback
         (dapdbg--register-callback seq callback))
-    (process-send-string dapdbg--process (format "%s\r\n%s" hdrs body))))
+    (process-send-string (dapdbg-session-process dapdbg--ssn) (format "%s\r\n%s" hdrs body))))
 
 (defun dapdbg--parse-json (str)
   (let* ((json-array-type 'list)
@@ -298,19 +303,25 @@ version 14 onwards.")
   (let ((hdr-pairs (mapcar #'dapdbg--parse-header-line (cl-remove-if #'seq-empty-p (string-split hdr "\r\n")))))
     (string-to-number (alist-get "Content-Length" hdr-pairs nil nil #'string=))))
 
-(defun dapdbg--parse-message (msg)
-  (let ((end-of-header (string-search "\r\n\r\n" msg)))
-    (unless end-of-header
-      (error "malformed message from debugger"))
-    (let* ((hdrs (substring msg 0 (+ end-of-header 2)))
-           (content-length (dapdbg--parse-header (substring msg 0 end-of-header)))
-           (beg (+ end-of-header 4))
-           (end (+ beg content-length))
-           (body (substring msg beg end)))
-      (dapdbg--io-message hdrs body nil)
-      (list
-       :parsed-length end
-       :parsed-msg (dapdbg--parse-json (substring body 0 content-length))))))
+(defun dapdbg--parse-message (received-msg)
+  (let* ((msg (concat (dapdbg-session-buffer dapdbg--ssn) received-msg))
+         (end-of-header (string-search "\r\n\r\n" msg)))
+    (if end-of-header
+        (let* ((hdrs (substring msg 0 (+ end-of-header 2)))
+               (content-length (dapdbg--parse-header (substring msg 0 end-of-header)))
+               (beg (+ end-of-header 4))
+               (end (+ beg content-length)))
+          (if (>= (length msg) (1- end))
+              (let ((body (substring msg beg end)))
+                (dapdbg--io-message hdrs body nil)
+                (setf (dapdbg-session-buffer dapdbg--ssn) "")
+                (list
+                 :parsed-length end
+                 :parsed-msg (dapdbg--parse-json (substring body 0 content-length))))
+            (setf (dapdbg-session-buffer dapdbg--ssn) msg)
+            (list :parsed-length (length received-msg) :parsed-msg nil)))
+      (setf (dapdbg-session-buffer dapdbg--ssn) msg)
+      (list :parsed-length (length received-msg) :parsed-msg nil))))
 
 (defun dapdbg--io-buf ()
   "Buffer to display request/response messages if dapdbg-print-io is t"

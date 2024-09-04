@@ -1,5 +1,4 @@
 (require 'dapdbg)
-(require 'gdb-mi)
 
 (define-minor-mode dapdbg-ui-mode
   "Toggle dapdbg-ui-mode.
@@ -16,7 +15,6 @@ information. It includes a keymap for basic debugger control."
 
 (defun dapdbg-ui-mode--enable ()
   (make-variable-buffer-local 'dapdbg-ui--buffer-breakpoints)
-  (make-variable-buffer-local 'dapdbg-ui--marker-overlay)
   (when (< left-margin-width 2)
     (dapdbg-ui--set-left-margin 2)))
 
@@ -31,36 +29,46 @@ information. It includes a keymap for basic debugger control."
          window left-margin-width right-margin-width))))
 
 (defface dapdbg-ui-marker-face
-  '((((class color)) :background "darkslategray")
-    (t :weight bold))
+  '((t :inherit (secondary-selection)))
   "Face for current line marker")
 
-(defface dapdbg-ui-marker-arrow-face
-  '((((class color)) :foreground "red" :background "reset")
-    (t :weight bold))
-  "Face for current line marker")
+(defface dapdbg-ui-arrow-face
+  '((t :inherit (warning)))
+  "Face for current line marker arrow")
 
-(defun dapdbg-ui-mode--set-marker (line)
-  (save-excursion
-    (save-restriction
-      (widen)
-    (goto-line line)
-    (let ((olay (make-overlay
-                 (line-beginning-position)
-                 (line-end-position)))
-          (invisible-str (make-string 1 ?x))
-          (margin-arrow-display-properties
-           (list (list 'margin 'left-margin) 
-                 (propertize "->" 'face 'dapdbg-ui-marker-arrow-face))))
-      (add-text-properties 0 1 (list
-                                'display margin-arrow-display-properties)
-                                invisible-str)
-      (overlay-put olay 'face 'dapdbg-ui-marker-face)
-      (overlay-put olay 'before-string invisible-str)))))
+(defvar dapdbg-ui--marker-overlay nil)
 
+(defun dapdpg-ui--make-marker-overlay (start end buf)
+  (let ((olay (make-overlay start end))
+        (invisible-str (make-string 1 ?x))
+        (marker-display-properties
+         (list (list 'margin 'left-margin) 
+               (propertize "=>" 'face 'dapdbg-ui-arrow-face))))
+    (put-text-property 0 1 'display marker-display-properties invisible-str)
+    (overlay-put olay 'face 'dapdbg-ui-marker-face)
+    (overlay-put olay 'before-string invisible-str)
+    olay))
+
+(defun dapdbg-ui-mode--set-marker (buf linenumber)
+  (with-current-buffer buf
+    (save-excursion
+      (save-restriction
+        (widen)
+        (goto-char (point-min))
+        (forward-line (1- linenumber))
+        (let ((bol (line-beginning-position))
+              (eol (line-end-position)))
+          (if dapdbg-ui--marker-overlay
+              (move-overlay dapdbg-ui--marker-overlay bol eol buf) 
+            (setq dapdbg-ui--marker-overlay
+                  (dapdpg-ui--make-marker-overlay bol eol buf))))))))
+
+(defun dapdbg-ui--handle-stopped-event (_parsed-msg)
+  (dapdbg-stacktrace nil (lambda (parsed-msg)
+                           
   
-
-
+(add-hook 'dapdbg--stopped-callback-list 'dapdbg-ui--handle-stopped-event)
+          
 (defun dapdbg-ui--set-source-breakpoint (filename line enabled bp-number)
   (save-excursion
     (with-current-buffer (find-file filename)
