@@ -63,11 +63,27 @@ information. It includes a keymap for basic debugger control."
             (setq dapdbg-ui--marker-overlay
                   (dapdpg-ui--make-marker-overlay bol eol buf))))))))
 
+(defun dapdbg-ui--handle-stacktrace (parsed-msg)
+  (let* ((stack (gethash "stackFrames" (gethash "body" parsed-msg)))
+         (ipRef (gethash "instructionPointerReference" (car stack)))
+         (source (gethash "source" (car stack))))
+    (when source
+      (let* ((filename (gethash "path" source))
+            (linenumber (gethash "line" (car stack)))
+            (buf (find-file filename)))
+        (with-current-buffer buf
+          (dapdbg-ui-mode t))
+        (dapdbg-ui-mode--set-marker buf linenumber)))))
+
+        
+
 (defun dapdbg-ui--handle-stopped-event (_parsed-msg)
-  (dapdbg-stacktrace nil (lambda (parsed-msg)
+  (dapdbg-stacktrace nil #'dapdbg-ui--handle-stacktrace))
+
+                           
                            
   
-(add-hook 'dapdbg--stopped-callback-list 'dapdbg-ui--handle-stopped-event)
+(add-hook 'dapdbg--stopped-callback-list #'dapdbg-ui--handle-stopped-event)
           
 (defun dapdbg-ui--set-source-breakpoint (filename line enabled bp-number)
   (save-excursion

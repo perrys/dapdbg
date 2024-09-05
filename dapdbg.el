@@ -67,6 +67,11 @@ version 14 onwards.")
   (interactive "fProgram to launch: \nsProgram arguments: ")
   (dapdbg--start program program-arguments dapdbg--gdb-plist))
 
+(defun dapdbg-next ()
+  (interactive)
+  (dapdbg--send-request "next"
+                        (list :threadId (dapdbg-session-thread-id dapdbg--ssn))))
+
 (defun dapdbg-continue ()
   (interactive)
   (dapdbg--send-request "continue"
@@ -82,13 +87,12 @@ version 14 onwards.")
                         (list :source (list :name (file-name-nondirectory filename) :path filename)
                               :breakpoints (vector (list :line line)))))
 
-(defun dapdbg-stacktrace (&optional thread-id)
+(defun dapdbg-stacktrace (&optional thread-id callback)
   (interactive)
   (let ((tid thread-id))
     (unless tid
       (setq tid (dapdbg-session-thread-id dapdbg--ssn)))
-    (dapdbg--send-request "stackTrace"
-                          (list :threadId tid))))
+    (dapdbg--send-request "stackTrace" (list :threadId tid) callback)))
 
 (defface dapdbg-request-face
   '((t :inherit (warning)))
@@ -143,7 +147,7 @@ version 14 onwards.")
                :name "dapdbg-session"
                :connection-type 'pipe
                :coding 'no-conversion
-               :command '("lldb-dap-18");;command-line
+               :command command-line
                :stderr "*debugger stderr*"
                :filter #'dapdbg--handle-message
                :noquery t)))
@@ -230,26 +234,31 @@ version 14 onwards.")
      (dapdbg--send-request "configurationDone" nil #'dapdbg--handle-response-configdone t))
     ("stopped"
      (dapdbg--handle-event-stopped parsed-msg)
-     (run-hook-with-args dapdbg--stopped-callback-list parsed-msg))
+     (run-hook-with-args 'dapdbg--stopped-callback-list parsed-msg))
     ("continued" (run-hook-with-args dapdbg--continued-callback-list parsed-msg))
     ("output" (run-hook-with-args dapdbg--output-callback-list parsed-msg))
     ("thread" (run-hook-with-args dapdbg--thread-callback-list parsed-msg))
     (`,an-event (message "event: %s" an-event))))
 
 (defun dapdbg--handle-message (_process msg)
-  (message "len: %d %s" (length msg) msg)
-  (let ((remaining msg)
-        (chunks (list)))
-    (while (not (string-empty-p remaining))
-      (pcase-let ((`(:parsed-length ,length :parsed-msg ,parsed-msg) (dapdbg--parse-message remaining)))
-        (if parsed-msg
-            (pcase (gethash "type" parsed-msg)
-              ("event" (dapdbg--handle-event parsed-msg))
-              ("response" (dapdbg--handle-response parsed-msg))
-              (`,something (message "unrecognized message type %s" something)))
-          (add-to-list 'chunks length))
-        (setq remaining (substring remaining length))))
-    (reverse chunks)))
+  (catch 'incomplete-msg
+    (let ((remaining (concat (dapdbg-session-buffer dapdbg--ssn) msg))
+          (chunks (list)))
+      (while (not (string-empty-p remaining))
+        (pcase-let ((`(:parsed-length ,length :parsed-msg ,parsed-msg) (dapdbg--parse-message remaining)))
+          (if parsed-msg
+              (progn
+                (pcase (gethash "type" parsed-msg)
+                  ("event" (dapdbg--handle-event parsed-msg))
+                  ("response" (dapdbg--handle-response parsed-msg))
+                  (`,something (message "unrecognized message type %s" something)))
+                (add-to-list 'chunks length)
+                (setq remaining (substring remaining length)))
+            ;; message is incomplete, push it back to the buffer and return
+            (setf (dapdbg-session-buffer dapdbg--ssn) remaining)
+            (throw 'incomplete-msg))))
+      (setf (dapdbg-session-buffer dapdbg--ssn) "")
+      (reverse chunks))))
 
 (defun dapdbg--seq-and-inc ()
   (let ((seq-value (dapdbg-session-seq dapdbg--ssn)))
@@ -303,25 +312,25 @@ version 14 onwards.")
   (let ((hdr-pairs (mapcar #'dapdbg--parse-header-line (cl-remove-if #'seq-empty-p (string-split hdr "\r\n")))))
     (string-to-number (alist-get "Content-Length" hdr-pairs nil nil #'string=))))
 
-(defun dapdbg--parse-message (received-msg)
-  (let* ((msg (concat (dapdbg-session-buffer dapdbg--ssn) received-msg))
-         (end-of-header (string-search "\r\n\r\n" msg)))
-    (if end-of-header
-        (let* ((hdrs (substring msg 0 (+ end-of-header 2)))
-               (content-length (dapdbg--parse-header (substring msg 0 end-of-header)))
-               (beg (+ end-of-header 4))
-               (end (+ beg content-length)))
-          (if (>= (length msg) (1- end))
-              (let ((body (substring msg beg end)))
-                (dapdbg--io-message hdrs body nil)
-                (setf (dapdbg-session-buffer dapdbg--ssn) "")
-                (list
-                 :parsed-length end
-                 :parsed-msg (dapdbg--parse-json (substring body 0 content-length))))
-            (setf (dapdbg-session-buffer dapdbg--ssn) msg)
-            (list :parsed-length (length received-msg) :parsed-msg nil)))
-      (setf (dapdbg-session-buffer dapdbg--ssn) msg)
-      (list :parsed-length (length received-msg) :parsed-msg nil))))
+(defconst dapdbg--not-parsed-response
+  (list :parsed-length 0 :parsed-msg nil))
+
+(defun dapdbg--parse-message (msg)
+  (catch 'incomplete
+    (let ((end-of-header (string-search "\r\n\r\n" msg)))
+      (unless end-of-header
+        (throw 'incomplete 'dapdbg--not-parsed-response))
+      (let* ((hdrs (substring msg 0 (+ end-of-header 2)))
+             (content-length (dapdbg--parse-header (substring msg 0 end-of-header)))
+             (beg (+ end-of-header 4))
+             (end (+ beg content-length)))
+        (unless (>= (length msg) (1- end))
+          (throw 'incomplete 'dapdbg--not-parsed-response))
+        (let ((body (substring msg beg end)))
+          (dapdbg--io-message hdrs body nil)
+          (list
+           :parsed-length end
+           :parsed-msg (dapdbg--parse-json (substring body 0 content-length))))))))
 
 (defun dapdbg--io-buf ()
   "Buffer to display request/response messages if dapdbg-print-io is t"
