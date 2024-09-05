@@ -268,7 +268,7 @@ version 14 onwards.")
                 (setq remaining (substring remaining length)))
             ;; message is incomplete, push it back to the buffer and return
             (setf (dapdbg-session-buffer dapdbg--ssn) remaining)
-            (throw 'incomplete-msg))))
+            (throw 'incomplete-msg nil))))
       (setf (dapdbg-session-buffer dapdbg--ssn) "")
       (reverse chunks))))
 
@@ -344,16 +344,22 @@ version 14 onwards.")
            :parsed-length end
            :parsed-msg (dapdbg--parse-json (substring body 0 content-length))))))))
 
+(defun dapdbg--get-or-create-buffer (buf-name)
+  "Like get-buffer-create, but return a cons cell of the buffer and a flag to say if it was just created"
+  (let* ((buf (get-buffer buf-name)))
+    (if buf
+        (cons buf nil)
+      (cons (get-buffer-create buf-name) t))))
+  
+
 (defun dapdbg--io-buf ()
   "Buffer to display request/response messages if dapdbg-print-io is t"
-  (let* ((buf-name "*dapdbg IO*")
-         (buf (get-buffer buf-name)))
-    (unless buf
-      (setq buf (get-buffer-create buf-name))
-      (with-current-buffer buf
+  (let ((buf-created (dapdbg--get-or-create-buffer "*dapdbg IO*"))) 
+    (when (cdr buf-created)
+      (with-current-buffer (car buf-created)
         (js-json-mode)
         (font-lock-mode -1)))
-    buf))
+    (car buf-created))) 
 
 (defun dapdbg--io-message (hdrs msg is-request)
   (when dapdbg-io-print-flag

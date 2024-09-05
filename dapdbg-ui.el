@@ -63,6 +63,38 @@ information. It includes a keymap for basic debugger control."
             (setq dapdbg-ui--marker-overlay
                   (dapdpg-ui--make-marker-overlay bol eol buf))))))))
 
+(defvar-keymap dapdbg-ui-stacktrace-mode-map
+  :doc "Local keymap for `Buffer-menu-mode' buffers."
+  :parent tabulated-list-mode-map
+  "RET" #'dapdbg-ui--switch-stackframe)
+
+(define-derived-mode dapdbg-ui-stacktrace-mode tabulated-list-mode "Stack"
+  "Major mode for stack trace display"
+  :interactive nil
+  (setq tabulated-list-format
+        (vector '("Prog Counter" 12 nil :right-align t)
+                '("Function" 999 nil)))
+  (tabulated-list-init-header))
+
+(defun dapdbg-ui--stacktrace-refresh (stacktrace)
+  (let ((buf-created (dapdbg--get-or-create-buffer "*Stack*"))) 
+    (when (cdr buf-created)
+      (with-current-buffer (car buf-created)
+        (dapdbg-ui-stacktrace-mode)
+        (font-lock-mode -1)))
+    (with-current-buffer (car buf-created)
+      (setq tabulated-list-entries
+            (mapcar
+             (lambda (frame)
+               (let ((id (gethash "id" frame))
+                     (iptr (substring (gethash "instructionPointerReference" frame) 2))
+                     (name (gethash "name" frame)))
+                 (list id (vector
+                           (propertize iptr 'face 'font-lock-number-face) 
+                           (propertize name 'face 'font-lock-function-name-face)))))
+             stacktrace))
+      (tabulated-list-print))))
+  
 (defun dapdbg-ui--handle-stacktrace (parsed-msg)
   (let* ((stack (gethash "stackFrames" (gethash "body" parsed-msg)))
          (ipRef (gethash "instructionPointerReference" (car stack)))
@@ -73,15 +105,11 @@ information. It includes a keymap for basic debugger control."
             (buf (find-file filename)))
         (with-current-buffer buf
           (dapdbg-ui-mode t))
-        (dapdbg-ui-mode--set-marker buf linenumber)))))
-
-        
+        (dapdbg-ui-mode--set-marker buf linenumber)))
+    (dapdbg-ui--stacktrace-refresh stack)))
 
 (defun dapdbg-ui--handle-stopped-event (_parsed-msg)
   (dapdbg-stacktrace nil #'dapdbg-ui--handle-stacktrace))
-
-                           
-                           
   
 (add-hook 'dapdbg--stopped-callback-list #'dapdbg-ui--handle-stopped-event)
           
