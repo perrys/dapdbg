@@ -182,6 +182,18 @@ version 14 onwards.")
                :locale "en-us")))
     (dapdbg--send-request "initialize" args #'dapdbg--handle-initialize-response t)))
 
+(defun dapdbg--disassembly-request (callback mem-ref &optional instructions-preceeding instruction-count)
+  "Get disassembly for the given session, for the optional
+   address range (defaults to 64 instructions either side of the
+   instruction pointer)."
+  (unless (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg-ssn))
+    (error "disassemble request is not supported by this debug adapter"))
+  (let ((disassemble-args (list :memoryReference (format "0x%x" mem-ref)
+                                :instructionOffset (or instructions-preceeding -63)
+                                :instructionCount (or instruction-count 64))))
+    (dapdbg--send-request "disassemble" disassemble-args
+                          (lambda (msg) (funcall callback (gethash "instructions" (gethash "body" msg)))))))
+
 (defun dapdbg--ready-p ()
   (and dapdbg--ssn
        (process-live-p (dapdbg-session-process dapdbg--ssn))
@@ -363,6 +375,14 @@ version 14 onwards.")
                                 (if is-request 'dapdbg-request-face 'dapdbg-response-face)))
       )))
 
+(defun dapdbg--parse-address (strval)
+  (let  ((s-val (if (string= (downcase (substring strval 0 2)) "0x")
+                    (substring strval 2)
+                  strval)))
+    (string-to-number s-val 16)))
+
 (provide 'dapdbg)
 
 ;;; dabdbg.el ends here
+
+
