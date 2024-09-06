@@ -68,7 +68,7 @@ information. It includes a keymap for basic debugger control."
   :parent tabulated-list-mode-map
   "RET" #'dapdbg-ui--switch-stackframe)
 
-(define-derived-mode dapdbg-ui-stacktrace-mode tabulated-list-mode "Stack"
+(define-derived-mode dapdbg-ui-stacktrace-mode tabulated-list-mode "STrace"
   "Major mode for stack trace display"
   :interactive nil
   (setq tabulated-list-format
@@ -94,11 +94,58 @@ information. It includes a keymap for basic debugger control."
                            (propertize name 'face 'font-lock-function-name-face)))))
              stacktrace))
       (tabulated-list-print))))
-  
+
+(define-derived-mode dapdbg-ui-registers-mode tabulated-list-mode "Reg"
+  "Major mode for registers display"
+  :interactive nil
+  (setq tabulated-list-format
+        (vector '("Name" 8 nil :right-align nil)
+                '("Value" 999 nil)))
+  (tabulated-list-init-header))
+
+(defun dapdbg-ui--registers-refresh (registers)
+  (let ((buf-created (dapdbg--get-or-create-buffer "*Registers*"))) 
+    (when (cdr buf-created)
+      (with-current-buffer (car buf-created)
+        (dapdbg-ui-registers-mode)
+        (font-lock-mode -1)))
+    (with-current-buffer (car buf-created)
+      (setq tabulated-list-entries
+            (mapcar
+             (lambda (frame)
+               (let ((name (gethash "name" frame))
+                     (value (gethash "value" frame)))
+                 (list name (vector
+                           (propertize name 'face 'font-lock-variable-name-face) 
+                           (propertize value 'face 'font-lock-number-face)))))
+             registers))
+      (tabulated-list-print))))
+
+(defun dapdbg-ui--handle-locals (parsed-msg)
+  nil)
+
+(defun dapdbg-ui--handle-registers (parsed-msg)
+  (let ((registers (gethash "variables" (gethash "body" parsed-msg))))
+    (dapdbg-ui--registers-refresh registers)))
+    
+
+
+(defun dapdbg-ui--handle-scopes (parsed-msg)
+  (let ((scopes (gethash "scopes" (gethash "body" parsed-msg))))
+    (dolist (scope scopes)
+      (let ((kind (or (gethash "name" scope) (gethash "presentationHint" scope)))
+            (id (gethash "variablesReference" scope)))
+        (pcase (downcase kind)
+          ("locals" (dapdbg--variables id #'dapdbg-ui--handle-locals))
+          ("registers" (dapdbg--variables id #'dapdbg-ui--handle-registers))
+          (`,something (message "unknown scope type: %s" something)))))))
+            
 (defun dapdbg-ui--handle-stacktrace (parsed-msg)
   (let* ((stack (gethash "stackFrames" (gethash "body" parsed-msg)))
-         (ipRef (gethash "instructionPointerReference" (car stack)))
+         (ip-ref (gethash "instructionPointerReference" (car stack)))
+         (frame-id (gethash "id" (car stack)))
          (source (gethash "source" (car stack))))
+    (dapdbg--scopes frame-id #'dapdbg-ui--handle-scopes)
     (when source
       (let* ((filename (gethash "path" source))
             (linenumber (gethash "line" (car stack)))

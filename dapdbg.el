@@ -94,6 +94,14 @@ version 14 onwards.")
       (setq tid (dapdbg-session-thread-id dapdbg--ssn)))
     (dapdbg--send-request "stackTrace" (list :threadId tid) callback)))
 
+(defun dapdbg--scopes (frame-id callback)
+  (interactive)
+  (dapdbg--send-request "scopes" (list :frameId frame-id) callback))
+
+(defun dapdbg--variables (ref-id callback)
+  (interactive)
+  (dapdbg--send-request "variables" (list :variablesReference ref-id) callback))
+
 (defface dapdbg-request-face
   '((t :inherit (warning)))
   "Face for requests to the DAP server")
