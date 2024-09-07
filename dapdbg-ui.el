@@ -76,6 +76,7 @@ information. It includes a keymap for basic debugger control."
                 '("Function" 999 nil)))
   (tabulated-list-init-header))
 
+
 (defun dapdbg-ui--stacktrace-refresh (stacktrace)
   (let ((buf-created (dapdbg--get-or-create-buffer "*Stack*"))) 
     (when (cdr buf-created)
@@ -95,49 +96,76 @@ information. It includes a keymap for basic debugger control."
              stacktrace))
       (tabulated-list-print))))
 
+(define-derived-mode dapdbg-ui-variables-mode tabulated-list-mode "Var"
+  "Major mode for local and global variables display"
+  :interactive nil
+  (setq tabulated-list-format
+        (vector '("Name" 12 nil :right-align nil)
+                '("Value" 999 nil)))
+  (tabulated-list-init-header))
+
 (define-derived-mode dapdbg-ui-registers-mode tabulated-list-mode "Reg"
   "Major mode for registers display"
   :interactive nil
   (setq tabulated-list-format
-        (vector '("Name" 8 nil :right-align nil)
+        (vector '("Name" 12 nil :right-align nil)
                 '("Value" 999 nil)))
   (tabulated-list-init-header))
 
-(defun dapdbg-ui--registers-refresh (registers)
-  (let ((buf-created (dapdbg--get-or-create-buffer "*Registers*"))) 
-    (when (cdr buf-created)
-      (with-current-buffer (car buf-created)
-        (dapdbg-ui-registers-mode)
-        (font-lock-mode -1)))
-    (with-current-buffer (car buf-created)
-      (setq tabulated-list-entries
-            (mapcar
-             (lambda (frame)
-               (let ((name (gethash "name" frame))
-                     (value (gethash "value" frame)))
-                 (list name (vector
-                           (propertize name 'face 'font-lock-variable-name-face) 
-                           (propertize value 'face 'font-lock-number-face)))))
-             registers))
-      (tabulated-list-print))))
+(defmacro dapgdb-ui--make-tabulated-list-refresh (short-name docstring buf-name buf-initializer thing-processor)
+          `(defun ,(intern (format "dapdbg-ui--%s-refresh" short-name)) (thing-list)
+             ,docstring
+             (let ((buf-created (dapdbg--get-or-create-buffer ,buf-name))) 
+               (when (cdr buf-created)
+                 (with-current-buffer (car buf-created)
+                   ,buf-initializer))
+               (with-current-buffer (car buf-created)
+                 (setq tabulated-list-entries
+                       (mapcar ,thing-processor thing-list))
+                 (tabulated-list-print)))))
 
-(defun dapdbg-ui--handle-locals (parsed-msg)
-  nil)
+(dapgdb-ui--make-tabulated-list-refresh
+ "locals"
+ "Buffer to display local variables"
+ "*Locals*" 
+ (progn
+    (dapdbg-ui-variables-mode)
+    (font-lock-mode -1))
+ (lambda (reg)
+    (let ((name (gethash "name" reg))
+          (value (gethash "value" reg)))
+      (list name (vector
+                  (propertize name 'face 'font-lock-variable-name-face) 
+                  (propertize value 'face 'font-lock-number-face))))))
 
-(defun dapdbg-ui--handle-registers (parsed-msg)
-  (let ((registers (gethash "variables" (gethash "body" parsed-msg))))
-    (dapdbg-ui--registers-refresh registers)))
-    
+(dapgdb-ui--make-tabulated-list-refresh
+ "registers"
+ "Buffer to display register list"
+ "*Registers*" 
+ (progn
+    (dapdbg-ui-registers-mode)
+    (font-lock-mode -1))
+ (lambda (reg)
+    (let ((name (gethash "name" reg))
+          (value (gethash "value" reg)))
+      (list name (vector
+                  (propertize name 'face 'font-lock-variable-name-face) 
+                  (propertize value 'face 'font-lock-number-face))))))
 
+(defun dapdbg-ui--handle-scope (parsed-msg handler)
+  (message "handle scope: %s" parsed-msg)
+  (let ((vars (gethash "variables" (gethash "body" parsed-msg))))
+    (funcall handler vars)))
 
 (defun dapdbg-ui--handle-scopes (parsed-msg)
+  (message "handle scopes: %s" parsed-msg)
   (let ((scopes (gethash "scopes" (gethash "body" parsed-msg))))
     (dolist (scope scopes)
       (let ((kind (or (gethash "name" scope) (gethash "presentationHint" scope)))
             (id (gethash "variablesReference" scope)))
         (pcase (downcase kind)
-          ("locals" (dapdbg--variables id #'dapdbg-ui--handle-locals))
-          ("registers" (dapdbg--variables id #'dapdbg-ui--handle-registers))
+          ("locals" (dapdbg--variables id (lambda (msg) (dapdbg-ui--handle-scope msg #'dapdbg-ui--locals-refresh))))
+          ("registers" (dapdbg--variables id (lambda (msg) (dapdbg-ui--handle-scope msg #'dapdbg-ui--registers-refresh))))
           (`,something (message "unknown scope type: %s" something)))))))
             
 (defun dapdbg-ui--handle-stacktrace (parsed-msg)
@@ -169,3 +197,4 @@ information. It includes a keymap for basic debugger control."
 
 
 
+(provide 'dapdbg-ui)
