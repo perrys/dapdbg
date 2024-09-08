@@ -1,4 +1,17 @@
+;; dapdbg-ui.el --- User Interface for dapdbg -*- lexical-binding: t; -*-
+
 (require 'dapdbg)
+
+(defvar-keymap dapdbg-ui-mode-map
+  :doc "Keymap for basic debugger controls."
+  "C-<f9>" #'dapdbg-set-breakpoint
+  "<f9>" #'dapdbg-next
+  "C-x C-n i" #'dapdbg-next-instruction
+  "<f12>" #'dapdbg-step
+  "C-x C-s i" #'dapdbg-step-instruction
+  "S-<f9>" #'dapdbg-continue
+  "S-<f12>" #'dapdbg-finish
+  )
 
 (define-minor-mode dapdbg-ui-mode
   "Toggle dapdbg-ui-mode.
@@ -12,6 +25,13 @@ information. It includes a keymap for basic debugger control."
       (dapdbg-ui-mode--enable)
     (dapdbg-ui-mode--disable)))
 
+(defun dapdbg-ui-start-lldb (command-line)
+  (interactive (list (read-shell-command "Target (command-line): ")))
+  (dapdbg--start-lldb command-line))
+
+(defun dapdbg-ui-start-gdb (command-line)
+  (interactive (list (read-shell-command "Target (command-line): ")))
+  (dapdbg--start-gdb command-line))
 
 (defun dapdbg-ui-mode--enable ()
   (make-variable-buffer-local 'dapdbg-ui--buffer-breakpoints)
@@ -61,7 +81,8 @@ information. It includes a keymap for basic debugger control."
           (if dapdbg-ui--marker-overlay
               (move-overlay dapdbg-ui--marker-overlay bol eol buf) 
             (setq dapdbg-ui--marker-overlay
-                  (dapdpg-ui--make-marker-overlay bol eol buf))))))))
+                  (dapdpg-ui--make-marker-overlay bol eol buf)))))))
+  (display-buffer buf))
 
 (defvar-keymap dapdbg-ui-stacktrace-mode-map
   :doc "Local keymap for `Buffer-menu-mode' buffers."
@@ -94,15 +115,21 @@ information. It includes a keymap for basic debugger control."
                            (propertize iptr 'face 'font-lock-number-face) 
                            (propertize name 'face 'font-lock-function-name-face)))))
              stacktrace))
-      (tabulated-list-print))))
+      (tabulated-list-print))
+    (display-buffer (car buf-created))))
 
-(define-derived-mode dapdbg-ui-variables-mode tabulated-list-mode "Var"
-  "Major mode for local and global variables display"
+(define-derived-mode dapdbg-ui-locals-mode tabulated-list-mode "Var"
+  "Major mode for local variables display"
   :interactive nil
   (setq tabulated-list-format
         (vector '("Name" 12 nil :right-align nil)
                 '("Value" 999 nil)))
   (tabulated-list-init-header))
+
+(defvar-keymap dapdbg-ui-locals-mode-map
+  :doc "Local keymap for `Buffer-menu-mode' buffers."
+  :parent tabulated-list-mode-map
+  "TAB" #'dapdbg-ui--expand-variable)
 
 (define-derived-mode dapdbg-ui-registers-mode tabulated-list-mode "Reg"
   "Major mode for registers display"
@@ -112,62 +139,119 @@ information. It includes a keymap for basic debugger control."
                 '("Value" 999 nil)))
   (tabulated-list-init-header))
 
-(defmacro dapgdb-ui--make-tabulated-list-refresh (short-name docstring buf-name buf-initializer thing-processor)
-          `(defun ,(intern (format "dapdbg-ui--%s-refresh" short-name)) (thing-list)
-             ,docstring
-             (let ((buf-created (dapdbg--get-or-create-buffer ,buf-name))) 
-               (when (cdr buf-created)
-                 (with-current-buffer (car buf-created)
-                   ,buf-initializer))
-               (with-current-buffer (car buf-created)
-                 (setq tabulated-list-entries
-                       (mapcar ,thing-processor thing-list))
-                 (tabulated-list-print)))))
+(defun dapdbg-ui--add-to-variables-tree (thing-list parent-id root-list-sym id-sym var-map)
+  (let ((parent (gethash parent-id var-map)))
+    (dolist (thing thing-list)
+      (let ((id (set id-sym (1+ (symbol-value id-sym)))))
+        (puthash id thing var-map)
+        (puthash :id id thing)
+        (puthash :children (list) thing))
+      (if parent
+          (push thing (gethash :children parent))
+        (add-to-list root-list-sym thing)))))
 
-(dapgdb-ui--make-tabulated-list-refresh
+(defun dapdbg-ui--make-tablulated-list-entries-r (node depth target-list)
+  (let* ((my-children (gethash :children node))
+         (switch (cond ((not (seq-empty-p my-children)) "- ")
+                       ((> (gethash "variablesReference" node) 0) "+ ")
+                       (t "  ")))
+         (pad-fmt (format "%%%ds%%s%%s" (* 2 depth)))
+         (name (format pad-fmt "" switch (gethash "name" node)))
+         (value (format "%s" (gethash "value" node)))
+         (id (gethash :id node))
+         (entry (list id (vector
+                          (propertize name 'face 'font-lock-variable-name-face) 
+                          (propertize value 'face 'font-lock-number-face)))))
+    (when my-children
+      (dolist (child my-children)
+        (setq target-list (dapdbg-ui--make-tablulated-list-entries-r child (1+ depth) target-list))))
+    (push entry target-list)
+    target-list))
+
+(defun dapdbg-ui--make-tablulated-list-entries (nodes)
+  (let ((target-list (list)))
+    (dolist (node nodes)
+      (let ((result (dapdbg-ui--make-tablulated-list-entries-r node 0 (list))))
+        (if target-list
+            (nconc target-list result)
+          (setq target-list result))))
+    target-list))
+
+
+(defun dapdbg-ui--variables-refresh (buf-name mode thing-list parent-id &optional reset-flag)
+  (let ((buf-created (dapdbg--get-or-create-buffer buf-name))) 
+    (when (cdr buf-created)
+      (with-current-buffer (car buf-created)
+        (funcall mode)
+        (font-lock-mode -1)
+        ;; do this after setting the major mode
+        (setq-local
+         var-counter 0
+         var-root-list (list)
+         var-map (make-hash-table :test 'equal))))
+    (with-current-buffer (car buf-created)
+      (when reset-flag
+        (setq-local
+         var-counter 0
+         var-root-list (list))
+        (clrhash var-map))
+      (dapdbg-ui--add-to-variables-tree thing-list parent-id 'var-root-list 'var-counter var-map)
+      (setq tabulated-list-entries (dapdbg-ui--make-tablulated-list-entries var-root-list))
+      (tabulated-list-print))
+    (display-buffer (car buf-created))))
+
+(defun dapdbg-ui--expand-variable (&optional parent-id)
+  (interactive)
+  (let* ((parent-id (or parent-id (tabulated-list-get-id)))
+         (parent (gethash parent-id var-map))
+         (var-id (gethash "variablesReference" parent))
+         (processor #'dapdbg-ui--locals-update)
+         (handler (lambda (parsed-msg1)
+                     (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
+                       (funcall processor parent-id vars)))))
+    (if (> (length (gethash :children parent)) 0)
+        (progn
+          (puthash :children (list) parent)
+          (setq tabulated-list-entries (dapdbg-ui--make-tablulated-list-entries var-root-list))
+          (tabulated-list-print))
+      (if (> var-id 0)
+          (dapdbg--variables var-id handler)
+        (warn "variable is not expandable")))))
+    
+
+(defmacro dapdbg-ui--make-tabulated-list-update (short-name docstring buf-name)
+  `(defun ,(intern (format "dapdbg-ui--%s-update" short-name)) (parent-id thing-list &optional reset-flag)
+     ,docstring
+     (dapdbg-ui--variables-refresh ,buf-name ',(intern (format "dapdbg-ui-%s-mode" short-name)) thing-list parent-id reset-flag)))
+
+(dapdbg-ui--make-tabulated-list-update
  "locals"
  "Buffer to display local variables"
- "*Locals*" 
- (progn
-    (dapdbg-ui-variables-mode)
-    (font-lock-mode -1))
- (lambda (reg)
-    (let ((name (gethash "name" reg))
-          (value (gethash "value" reg)))
-      (list name (vector
-                  (propertize name 'face 'font-lock-variable-name-face) 
-                  (propertize value 'face 'font-lock-number-face))))))
+ "*Locals*")
 
-(dapgdb-ui--make-tabulated-list-refresh
+(dapdbg-ui--make-tabulated-list-update
  "registers"
  "Buffer to display register list"
- "*Registers*" 
- (progn
-    (dapdbg-ui-registers-mode)
-    (font-lock-mode -1))
- (lambda (reg)
-    (let ((name (gethash "name" reg))
-          (value (gethash "value" reg)))
-      (list name (vector
-                  (propertize name 'face 'font-lock-variable-name-face) 
-                  (propertize value 'face 'font-lock-number-face))))))
+ "*Registers*")
 
-(defun dapdbg-ui--handle-scope (parsed-msg handler)
-  (message "handle scope: %s" parsed-msg)
-  (let ((vars (gethash "variables" (gethash "body" parsed-msg))))
-    (funcall handler vars)))
-
-(defun dapdbg-ui--handle-scopes (parsed-msg)
-  (message "handle scopes: %s" parsed-msg)
+(defun dapdbg-ui--handle-scopes (parsed-msg &optional parent-id)
   (let ((scopes (gethash "scopes" (gethash "body" parsed-msg))))
     (dolist (scope scopes)
       (let ((kind (or (gethash "name" scope) (gethash "presentationHint" scope)))
             (id (gethash "variablesReference" scope)))
-        (pcase (downcase kind)
-          ("locals" (dapdbg--variables id (lambda (msg) (dapdbg-ui--handle-scope msg #'dapdbg-ui--locals-refresh))))
-          ("registers" (dapdbg--variables id (lambda (msg) (dapdbg-ui--handle-scope msg #'dapdbg-ui--registers-refresh))))
-          (`,something (message "unknown scope type: %s" something)))))))
-            
+        (let ((processor
+               (pcase (downcase kind)
+                 ("locals" #'dapdbg-ui--locals-update)
+                 ("registers" #'dapdbg-ui--registers-update)
+                 (`,something
+                  (message "unknown scope type: %s" something)
+                  nil))))
+          (when processor
+            (let ((handler (lambda (parsed-msg1)
+                             (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
+                               (funcall processor parent-id vars t)))))
+              (dapdbg--variables id handler))))))))
+
 (defun dapdbg-ui--handle-stacktrace (parsed-msg)
   (let* ((stack (gethash "stackFrames" (gethash "body" parsed-msg)))
          (ip-ref (gethash "instructionPointerReference" (car stack)))
@@ -176,8 +260,8 @@ information. It includes a keymap for basic debugger control."
     (dapdbg--scopes frame-id #'dapdbg-ui--handle-scopes)
     (when source
       (let* ((filename (gethash "path" source))
-            (linenumber (gethash "line" (car stack)))
-            (buf (find-file filename)))
+             (linenumber (gethash "line" (car stack)))
+             (buf (find-file filename)))
         (with-current-buffer buf
           (dapdbg-ui-mode t))
         (dapdbg-ui-mode--set-marker buf linenumber)))
@@ -185,16 +269,32 @@ information. It includes a keymap for basic debugger control."
 
 (defun dapdbg-ui--handle-stopped-event (_parsed-msg)
   (dapdbg-stacktrace nil #'dapdbg-ui--handle-stacktrace))
-  
+
 (add-hook 'dapdbg--stopped-callback-list #'dapdbg-ui--handle-stopped-event)
-          
+
 (defun dapdbg-ui--set-source-breakpoint (filename line enabled bp-number)
   (save-excursion
     (with-current-buffer (find-file filename)
       (gdb-put-breakpoint-icon enabled bp-number line))))
 
-
-
-
+(defun dapdbg-ui-setup-many-windows ()
+  (add-to-list
+   'display-buffer-alist
+   '((major-mode . dapdbg-ui-stacktrace-mode)
+     (display-buffer-in-side-window)
+     (side . left)
+     (slot . 1)))
+  (add-to-list
+   'display-buffer-alist
+   '((major-mode . dapdbg-ui-registers-mode)
+     (display-buffer-in-side-window)
+     (side . right)
+     (slot . 2)))
+  (add-to-list
+   'display-buffer-alist
+   '((major-mode . dapdbg-ui-locals-mode)
+     (display-buffer-in-side-window)
+     (side . right)
+     (slot . 1))))
 
 (provide 'dapdbg-ui)

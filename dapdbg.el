@@ -59,23 +59,25 @@ version 14 onwards.")
         (if (process-live-p proc)
             (kill-process proc)))))
 
-(defun dapdbg-start-lldb (program &optional program-arguments)
-  (interactive "fProgram to launch: \nsProgram arguments: ")
-  (dapdbg--start program program-arguments dapdbg--lldb-plist))
+(defun dapdbg--start-lldb (command-line)
+  (dapdbg--start command-line dapdbg--lldb-plist))
 
-(defun dapdbg-start-gdb (program &optional program-arguments)
-  (interactive "fProgram to launch: \nsProgram arguments: ")
-  (dapdbg--start program program-arguments dapdbg--gdb-plist))
+(defun dapdbg--start-gdb (command-line)
+  (dapdbg--start command-line dapdbg--gdb-plist))
 
-(defun dapdbg-next ()
-  (interactive)
-  (dapdbg--send-request "next"
-                        (list :threadId (dapdbg-session-thread-id dapdbg--ssn))))
+(defmacro dapdbg--make-thread-command (name command docstring &optional args)
+  `(defun ,(intern (format "dapdbg-%s" name)) ()
+     (interactive)
+     (let ((pargs (list :threadId (dapdbg-session-thread-id dapdbg--ssn))))
+       ,(when args `(nconc pargs ,args))
+       (dapdbg--send-request ,command pargs))))
 
-(defun dapdbg-continue ()
-  (interactive)
-  (dapdbg--send-request "continue"
-                        (list :threadId (dapdbg-session-thread-id dapdbg--ssn))))
+(dapdbg--make-thread-command "next" "next" "Step one line (skip functions).")
+(dapdbg--make-thread-command "nexti" "next" "Step one instruction (skip functions)." '(:granularity "instruction"))
+(dapdbg--make-thread-command "step" "stepIn" "Step one source line.")
+(dapdbg--make-thread-command "stepi" "stepIn" "Step one instruction." '(:granularity "instruction"))
+(dapdbg--make-thread-command "finish" "stepOut" "Finish executing the current function.")
+(dapdbg--make-thread-command "continue" "continue" "Resume exceution.")
 
 (defun dapdbg-set-breakpoint (&optional filename line)
   (interactive)
@@ -161,21 +163,15 @@ version 14 onwards.")
                :noquery t)))
     (setq dapdbg--ssn (make-dapdbg-session :process proc))))
 
-(defun dapdbg--start (program program-arguments debugger-plist)
-  (when (and dapdbg--ssn (process-live-p (dapdbg-session-process dapdbg--ssn)))
-    (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
-      ("y" (dapdbg-quit))
-      (_ (error "Aborted"))))
-  (dapdbg--connect (eval (plist-get debugger-plist :command-line-sym)))
+(defun dapdbg--launch-initialize (program program-arguments debugger-plist)
   (let ((arguments (list
                     :name (file-name-nondirectory program)
                     :type (plist-get debugger-plist :type)
                     :request "launch"
                     :program (expand-file-name program)
                     (plist-get debugger-plist :stop-on-entry-sym) t)))
-    (when (not (string-empty-p program-arguments))
-      (let ((tokens (string-split program-arguments)))
-        (plist-put arguments :args tokens))) 
+    (when program-arguments
+      (plist-put arguments :args program-arguments)) 
     (setf (dapdbg-session-launch-args dapdbg--ssn) arguments))
   (let ((args (list
                :clientID "dapdbg"
@@ -189,6 +185,17 @@ version 14 onwards.")
                :supportsRunInTerminalRequest t
                :locale "en-us")))
     (dapdbg--send-request "initialize" args #'dapdbg--handle-initialize-response t)))
+
+(defun dapdbg--start (command-line debugger-plist)
+  (let ((toks (string-split command-line nil t)))
+    (unless (> (length toks) 0)
+      (error "empty command-line"))
+    (when (and dapdbg--ssn (process-live-p (dapdbg-session-process dapdbg--ssn)))
+      (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
+        ("y" (dapdbg-quit))
+        (_ (error "Aborted"))))
+    (dapdbg--connect (eval (plist-get debugger-plist :command-line-sym)))
+    (dapdbg--launch-initialize (car toks) (cdr toks) debugger-plist)))
 
 (defun dapdbg--disassembly-request (callback mem-ref &optional instructions-preceeding instruction-count)
   "Get disassembly for the given session, for the optional
