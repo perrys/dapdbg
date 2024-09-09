@@ -79,6 +79,23 @@ version 14 onwards.")
 (dapdbg--make-thread-command "finish" "stepOut" "Finish executing the current function.")
 (dapdbg--make-thread-command "continue" "continue" "Resume exceution.")
 
+(defun dapdbg--update-breakpoint-table (bp-response)
+  (unless (equal "setBreakpoints" (gethash "command" bp-response))
+    (error "not a breakpoint response"))
+  (let ((bp-table (dapdbg-session-source-breakpoints dapdbg--ssn))
+        (updated-table (make-hash-table :test 'equal)))
+    (dolist (bp-details (gethash "breakpoints" (gethash "body" bp-response)))
+      (let* ((linenumber (gethash "line" bp-details))
+             (source (gethash "source" bp-details))
+             (filename (gethash "path" source))
+             (source-table (gethash filename bp-table)))
+        (unless source-table
+          (setq source-table (make-hash-table :test 'eql))
+          (puthash filename source-table bp-table))
+        (puthash filename source-table updated-table)
+        (puthash linenumber bp-details source-table)))
+    (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table)))
+
 (defun dapdbg-toggle-breakpoint (&optional filename linenumber)
   (interactive)
   (unless filename
@@ -97,7 +114,8 @@ version 14 onwards.")
     (dapdbg--send-request
      "setBreakpoints"
      (list :source (list :name (file-name-nondirectory filename) :path filename)
-           :breakpoints (vconcat (mapcar (lambda (n) (list :line n)) (hash-table-keys source-table)))))))
+           :breakpoints (vconcat (mapcar (lambda (n) (list :line n)) (hash-table-keys source-table))))
+     #'dapdbg--update-breakpoint-table)))
 
 (defun dapdbg-stacktrace (&optional thread-id callback)
   (interactive)
@@ -256,6 +274,11 @@ version 14 onwards.")
       (remhash cb-seq cb-table)
       (funcall cb parsed-msg))))
 
+(defvar dapdbg--breakpoints-updated-callback-list nil
+  "Functions to call when the this session's breakpoints have been
+updated. The callback receives a hash table of filename ->
+breakpoint table mappings.")
+
 (defvar dapdbg--stopped-callback-list nil
   "Functions to call when the debugger sends a 'stopped' event. The
    callbacks receive the event message (i.e. this is an abnormal
@@ -384,7 +407,7 @@ version 14 onwards.")
     (if buf
         (cons buf nil)
       (cons (get-buffer-create buf-name) t))))
-  
+
 
 (defun dapdbg--io-buf ()
   "Buffer to display request/response messages if dapdbg-print-io is t"
@@ -413,6 +436,7 @@ version 14 onwards.")
         (insert "\n----------------------------------------\n\n")
         (add-face-text-property beg (point)
                                 (if is-request 'dapdbg-request-face 'dapdbg-response-face)))
+      (goto-char (point-max))
       )))
 
 (defun dapdbg--parse-address (strval)
