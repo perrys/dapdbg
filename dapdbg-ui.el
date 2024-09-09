@@ -142,7 +142,7 @@ information. It includes a keymap for basic debugger control."
 (defvar-keymap dapdbg-ui-locals-mode-map
   :doc "Local keymap for `dapdbg-ui-locals-mode' buffers."
   :parent tabulated-list-mode-map
-  "TAB" #'dapdbg-ui--expand-variable)
+  "TAB" #'dapdbg-ui--toggle-expand-variable)
 
 (define-derived-mode dapdbg-ui-locals-mode tabulated-list-mode "Var"
   "Major mode for local variables display"
@@ -218,11 +218,23 @@ information. It includes a keymap for basic debugger control."
         (clrhash var-map))
       (dapdbg-ui--add-to-variables-tree thing-list parent-id 'var-root-list 'var-counter var-map)
       (setq tabulated-list-entries (dapdbg-ui--make-tablulated-list-entries var-root-list))
-      (tabulated-list-print))
+      (let ((point (point)))
+        (tabulated-list-print)
+        (goto-char point)))
     (display-buffer (car buf-created))))
 
-(defun dapdbg-ui--expand-variable (&optional parent-id)
+(defun dapdbg-ui--un-expand-variable (parent)
+  (puthash :children (list) parent)
+  (setq tabulated-list-entries (dapdbg-ui--make-tablulated-list-entries var-root-list))
+  (let ((point (point)))
+    (tabulated-list-print)
+    (goto-char point)))
+
+(defun dapdbg-ui--toggle-expand-variable (&optional parent-id)
+  "Expand or un-expand the variable for the row at point in the tabulated-list."
   (interactive)
+  (unless var-map
+    (error "not in a variables window"))
   (let* ((parent-id (or parent-id (tabulated-list-get-id)))
          (parent (gethash parent-id var-map))
          (var-id (gethash "variablesReference" parent))
@@ -231,31 +243,32 @@ information. It includes a keymap for basic debugger control."
                     (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
                       (funcall processor parent-id vars)))))
     (if (> (length (gethash :children parent)) 0)
-        (progn
-          (puthash :children (list) parent)
-          (setq tabulated-list-entries (dapdbg-ui--make-tablulated-list-entries var-root-list))
-          (tabulated-list-print))
+        (dapdbg-ui--un-expand-variable parent)
       (if (> var-id 0)
           (dapdbg--variables var-id handler)
         (warn "variable is not expandable")))))
 
-
-(defmacro dapdbg-ui--make-tabulated-list-update (short-name docstring buf-name)
+(defmacro dapdbg-ui--make-variables-update-fn (short-name docstring buf-name)
   `(defun ,(intern (format "dapdbg-ui--%s-update" short-name)) (parent-id thing-list &optional reset-flag)
      ,docstring
      (dapdbg-ui--variables-refresh ,buf-name ',(intern (format "dapdbg-ui-%s-mode" short-name)) thing-list parent-id reset-flag)))
 
-(dapdbg-ui--make-tabulated-list-update
+(dapdbg-ui--make-variables-update-fn
+ "globals"
+ "Buffer to display global variables"
+ "*Globals*")
+
+(dapdbg-ui--make-variables-update-fn
  "locals"
  "Buffer to display local variables"
  "*Locals*")
 
-(dapdbg-ui--make-tabulated-list-update
+(dapdbg-ui--make-variables-update-fn
  "registers"
  "Buffer to display register list"
  "*Registers*")
 
-(defun dapdbg-ui--handle-scopes (parsed-msg &optional parent-id)
+(defun dapdbg-ui--handle-scopes (parsed-msg)
   (let ((scopes (gethash "scopes" (gethash "body" parsed-msg))))
     (dolist (scope scopes)
       (let ((kind (or (gethash "name" scope) (gethash "presentationHint" scope)))
@@ -270,7 +283,7 @@ information. It includes a keymap for basic debugger control."
           (when processor
             (let ((handler (lambda (parsed-msg1)
                              (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                               (funcall processor parent-id vars t)))))
+                               (funcall processor nil vars t)))))
               (dapdbg--variables id handler))))))))
 
 (defun dapdbg-ui--handle-stacktrace (parsed-msg)
@@ -330,6 +343,7 @@ information. It includes a keymap for basic debugger control."
     (dapdbg-ui--draw-breakpoint-marker filename linenumber verified)))
 
 (defun dapdbg-ui-setup-many-windows ()
+  (interactive)
   (add-to-list
    'display-buffer-alist
    '((major-mode . dapdbg-ui-stacktrace-mode)
