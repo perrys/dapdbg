@@ -4,13 +4,13 @@
 
 (defvar-keymap dapdbg-ui-mode-map
   :doc "Keymap for basic debugger controls."
-  "C-<f9>" #'dapdbg-set-breakpoint
-  "<f9>" #'dapdbg-next
-  "C-x C-n i" #'dapdbg-next-instruction
-  "<f12>" #'dapdbg-step
-  "C-x C-s i" #'dapdbg-step-instruction
-  "S-<f9>" #'dapdbg-continue
-  "S-<f12>" #'dapdbg-finish
+  "<f1>" #'dapdbg-toggle-breakpoint
+  "<f2>" #'dapdbg-next
+  "C-<f2>" #'dapdbg-nexti
+  "<f3>" #'dapdbg-step
+  "C-<f3>" #'dapdbg-stepi
+  "S-<f3>" #'dapdbg-finish
+  "<f4>" #'dapdbg-continue
   )
 
 (define-minor-mode dapdbg-ui-mode
@@ -41,6 +41,17 @@ information. It includes a keymap for basic debugger control."
 (defun dapdbg-ui-mode--disable ()
   (dapdbg-ui--set-left-margin 0))
 
+(defvar dapdbg--source-breakpoints-alist nil
+  "List of source-code breakpoints for current or future debugging sessions.
+
+   Each entry is a cons pair of the form
+
+   (FILENAME . (BREAKPOINTS))
+
+   where filename is the full path to a source file, and
+   BREAKPOINTS is a list of plists which have the form given in
+   https://microsoft.github.io/debug-adapter-protocol/specification#Types_SourceBreakpoint")
+
 (defun dapdbg-ui--set-left-margin (width)
   (setq left-margin-width width)
   (let ((window (get-buffer-window (current-buffer) 0)))
@@ -56,15 +67,21 @@ information. It includes a keymap for basic debugger control."
   '((t :inherit (warning)))
   "Face for current line marker arrow")
 
+(defface dapdbg-ui-breakpoint-face
+  '((t :inherit (error)))
+  "Face for breakpoint markers")
+
 (defvar dapdbg-ui--marker-overlay nil)
 
-(defun dapdpg-ui--make-marker-overlay (start end buf)
+(defun dapdbg-ui--make-margin-marker-properties (&optional breakpoint-p)
+  (list (list 'margin 'left-margin) 
+        (propertize (if breakpoint-p ">" "=>") 'face 'dapdbg-ui-arrow-face)))
+  
+(defun dapdbg-ui--make-marker-overlay (start end buf)
   (let ((olay (make-overlay start end))
-        (invisible-str (make-string 1 ?x))
-        (marker-display-properties
-         (list (list 'margin 'left-margin) 
-               (propertize "=>" 'face 'dapdbg-ui-arrow-face))))
-    (put-text-property 0 1 'display marker-display-properties invisible-str)
+        (invisible-str (make-string 1 ?x)))
+    (put-text-property 0 1 'display (dapdbg-ui--make-margin-marker-properties) invisible-str)
+    (overlay-put olay :kind 'marker)
     (overlay-put olay 'face 'dapdbg-ui-marker-face)
     (overlay-put olay 'before-string invisible-str)
     olay))
@@ -76,12 +93,16 @@ information. It includes a keymap for basic debugger control."
         (widen)
         (goto-char (point-min))
         (forward-line (1- linenumber))
-        (let ((bol (line-beginning-position))
-              (eol (line-end-position)))
+        (let* ((bol (line-beginning-position))
+               (eol (line-end-position))
+               (breakpointp (cl-some (lambda (olay) (eq (overlay-get olay :kind) 'breakpoint))
+                                     (overlays-in bol eol))))
           (if dapdbg-ui--marker-overlay
               (move-overlay dapdbg-ui--marker-overlay bol eol buf) 
             (setq dapdbg-ui--marker-overlay
-                  (dapdpg-ui--make-marker-overlay bol eol buf)))))))
+                  (dapdbg-ui--make-marker-overlay bol eol buf)))
+          (put-text-property 0 1 'display (dapdbg-ui--make-margin-marker-properties breakpointp)
+                             (overlay-get dapdbg-ui--marker-overlay 'before-string))))))
   (display-buffer buf))
 
 (defvar-keymap dapdbg-ui-stacktrace-mode-map
@@ -118,6 +139,11 @@ information. It includes a keymap for basic debugger control."
       (tabulated-list-print))
     (display-buffer (car buf-created))))
 
+(defvar-keymap dapdbg-ui-locals-mode-map
+  :doc "Local keymap for `dapdbg-ui-locals-mode' buffers."
+  :parent tabulated-list-mode-map
+  "TAB" #'dapdbg-ui--expand-variable)
+
 (define-derived-mode dapdbg-ui-locals-mode tabulated-list-mode "Var"
   "Major mode for local variables display"
   :interactive nil
@@ -125,11 +151,6 @@ information. It includes a keymap for basic debugger control."
         (vector '("Name" 12 nil :right-align nil)
                 '("Value" 999 nil)))
   (tabulated-list-init-header))
-
-(defvar-keymap dapdbg-ui-locals-mode-map
-  :doc "Local keymap for `Buffer-menu-mode' buffers."
-  :parent tabulated-list-mode-map
-  "TAB" #'dapdbg-ui--expand-variable)
 
 (define-derived-mode dapdbg-ui-registers-mode tabulated-list-mode "Reg"
   "Major mode for registers display"
@@ -207,8 +228,8 @@ information. It includes a keymap for basic debugger control."
          (var-id (gethash "variablesReference" parent))
          (processor #'dapdbg-ui--locals-update)
          (handler (lambda (parsed-msg1)
-                     (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                       (funcall processor parent-id vars)))))
+                    (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
+                      (funcall processor parent-id vars)))))
     (if (> (length (gethash :children parent)) 0)
         (progn
           (puthash :children (list) parent)
@@ -217,7 +238,7 @@ information. It includes a keymap for basic debugger control."
       (if (> var-id 0)
           (dapdbg--variables var-id handler)
         (warn "variable is not expandable")))))
-    
+
 
 (defmacro dapdbg-ui--make-tabulated-list-update (short-name docstring buf-name)
   `(defun ,(intern (format "dapdbg-ui--%s-update" short-name)) (parent-id thing-list &optional reset-flag)
@@ -272,10 +293,41 @@ information. It includes a keymap for basic debugger control."
 
 (add-hook 'dapdbg--stopped-callback-list #'dapdbg-ui--handle-stopped-event)
 
-(defun dapdbg-ui--set-source-breakpoint (filename line enabled bp-number)
-  (save-excursion
-    (with-current-buffer (find-file filename)
-      (gdb-put-breakpoint-icon enabled bp-number line))))
+(defun dapdbg-ui--handle-breakpoint-event (parsed-msg)
+  (let* ((data (gethash "body" parsed-msg))
+         (reason (gethash "reason" data)))
+    (pcase reason
+      ("new" (dapdbg-ui--mark-breakpoint data))
+                                        ;("changed" (dapdbg-ui--refresh-breakpoints (gethash "path" (gethash "source" data))))
+      (`,something (message "breakpoint reason: %s" something)))))
+
+(add-hook 'dapdbg--breakpoint-callback-list #'dapdbg-ui--handle-breakpoint-event)
+
+(defun dapdbg-ui--draw-breakpoint-marker (filename linenumber verified)
+  (with-current-buffer (find-file filename)
+    (save-excursion
+      (save-restriction
+        (widen)
+        (goto-char (point-min))
+        (forward-line (1- linenumber))
+        (let ((marker (if verified "B" "b")))
+          (let ((olay (make-overlay (point) (point)))
+                (invisible-str (make-string 1 ?x))
+                (marker-display-properties
+                 (list (list 'margin 'left-margin) 
+                       (propertize marker 'face 'dapdbg-ui-breakpoint-face))))
+            (put-text-property 0 1 'display marker-display-properties invisible-str)
+            (overlay-put olay 'before-string invisible-str)
+            (overlay-put olay :kind 'breakpoint)
+            olay))))))
+
+(defun dapdbg-ui--mark-breakpoint (bp)
+  (let* ((bpinfo (gethash "breakpoint" bp))
+         (linenumber (gethash "line" bpinfo))
+         (verified (gethash "verified" bpinfo))
+         (source (gethash "source" bpinfo))
+         (filename (gethash "path" source)))
+    (dapdbg-ui--draw-breakpoint-marker filename linenumber verified)))
 
 (defun dapdbg-ui-setup-many-windows ()
   (add-to-list

@@ -79,15 +79,25 @@ version 14 onwards.")
 (dapdbg--make-thread-command "finish" "stepOut" "Finish executing the current function.")
 (dapdbg--make-thread-command "continue" "continue" "Resume exceution.")
 
-(defun dapdbg-set-breakpoint (&optional filename line)
+(defun dapdbg-toggle-breakpoint (&optional filename linenumber)
   (interactive)
   (unless filename
     (setq filename (expand-file-name (buffer-file-name))))
-  (unless line
-    (setq line (line-number-at-pos)))
-  (dapdbg--send-request "setBreakpoints"
-                        (list :source (list :name (file-name-nondirectory filename) :path filename)
-                              :breakpoints (vector (list :line line)))))
+  (unless linenumber
+    (setq linenumber (line-number-at-pos)))
+  (let* ((breakpoint-table (dapdbg-session-source-breakpoints dapdbg--ssn))
+         (source-table (gethash filename breakpoint-table)))
+    (unless source-table
+      (setq source-table (make-hash-table :test 'eql))
+      (puthash filename source-table breakpoint-table))
+    (let ((existing-bp (gethash linenumber source-table)))
+      (if existing-bp
+          (remhash linenumber source-table)
+        (puthash linenumber linenumber source-table)))
+    (dapdbg--send-request
+     "setBreakpoints"
+     (list :source (list :name (file-name-nondirectory filename) :path filename)
+           :breakpoints (vconcat (mapcar (lambda (n) (list :line n)) (hash-table-keys source-table)))))))
 
 (defun dapdbg-stacktrace (&optional thread-id callback)
   (interactive)
@@ -104,6 +114,10 @@ version 14 onwards.")
   (interactive)
   (dapdbg--send-request "variables" (list :variablesReference ref-id) callback))
 
+(defun dapdbg--memory-dump (start-address count &optional callback)
+  (dapdbg--send-request "readMemory" (list :memoryReference start-address :count count) callback))
+
+
 (defface dapdbg-request-face
   '((t :inherit (warning)))
   "Face for requests to the DAP server")
@@ -115,26 +129,16 @@ version 14 onwards.")
 (cl-defstruct dapdbg-session
   (process nil :read-only t)
   (callbacks (make-hash-table :test 'equal) :read-only t)
+  (source-breakpoints (make-hash-table :test 'equal) :read-only t)
   (buffer "")
   (seq 0)
   (thread-id nil)
   (launch-args nil)
   (config-done nil)
-  (capabilites nil))
+  (capabilities nil))
 
 (defvar dapdbg--ssn nil
   "The global session object (only one session is allowed)")
-
-(defvar dapdbg--source-breakpoints nil
-  "List of source-code breakpoints for current or future debugging sessions.
-
-   Each entry is a cons pair of the form
-
-   (FILENAME . (BREAKPOINTS))
-
-   where filename is the full path to a source file, and
-   BREAKPOINTS is a list of plists which have the form given in
-   https://microsoft.github.io/debug-adapter-protocol/specification#Types_SourceBreakpoint")
 
 (defcustom dapdbg-io-print-flag nil
   "Enables output of request & response messages to/from the DAP
@@ -151,6 +155,17 @@ version 14 onwards.")
         :command-line-sym 'dapdbg-gdb-command-line
         :stop-on-entry-sym :stopAtBeginningOfMainSubprogram))
 
+(defun dapdbg-print-capabilities ()
+  "List the capabilities of the current debugger.
+
+   See
+   https://microsoft.github.io/debug-adapter-protocol/specification#Types_Capabilities"
+  (interactive)
+  (message "Capabilities:")
+  (let* ((ht (dapdbg-session-capabilities dapdbg--ssn))
+         (keys (sort (hash-table-keys ht) 'string<)))
+    (dolist (key keys)
+      (message "%s: %s" key (gethash key ht)))))
 
 (defun dapdbg--connect (command-line)
   (let ((proc (make-process
@@ -201,7 +216,7 @@ version 14 onwards.")
   "Get disassembly for the given session, for the optional
    address range (defaults to 64 instructions either side of the
    instruction pointer)."
-  (unless (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg-ssn))
+  (unless (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
     (error "disassemble request is not supported by this debug adapter"))
   (let ((disassemble-args (list :memoryReference (format "0x%x" mem-ref)
                                 :instructionOffset (or instructions-preceeding -63)
@@ -220,7 +235,7 @@ version 14 onwards.")
       (unless (gethash cap caps)
         (dapdbg-disconnect)
         (error "Debugger does not have capability \"%s\"" cap)))
-    (setf (dapdbg-session-capabilites dapdbg--ssn) caps))
+    (setf (dapdbg-session-capabilities dapdbg--ssn) caps))
   (let ((args (dapdbg-session-launch-args dapdbg--ssn)))
                                         ;(dapdbg--set-all-breakpoints)
     (dapdbg--send-request "launch" args nil t)))
@@ -255,6 +270,9 @@ version 14 onwards.")
 (defvar dapdbg--thread-callback-list nil
   "Functions to call when the debugger sends an 'thread' event.")
 
+(defvar dapdbg--breakpoint-callback-list nil
+  "Functions to call when the debugger sends an 'breakpoint' event.")
+
 (defun dapdbg--handle-event (parsed-msg)
   (pcase (gethash "event" parsed-msg)
     ("initialized"
@@ -262,9 +280,10 @@ version 14 onwards.")
     ("stopped"
      (dapdbg--handle-event-stopped parsed-msg)
      (run-hook-with-args 'dapdbg--stopped-callback-list parsed-msg))
-    ("continued" (run-hook-with-args dapdbg--continued-callback-list parsed-msg))
-    ("output" (run-hook-with-args dapdbg--output-callback-list parsed-msg))
-    ("thread" (run-hook-with-args dapdbg--thread-callback-list parsed-msg))
+    ("continued" (run-hook-with-args 'dapdbg--continued-callback-list parsed-msg))
+    ("output" (run-hook-with-args 'dapdbg--output-callback-list parsed-msg))
+    ("thread" (run-hook-with-args 'dapdbg--thread-callback-list parsed-msg))
+    ("breakpoint" (run-hook-with-args 'dapdbg--breakpoint-callback-list parsed-msg))
     (`,an-event (message "event: %s" an-event))))
 
 (defun dapdbg--handle-message (_process msg)
