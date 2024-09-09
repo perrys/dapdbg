@@ -41,17 +41,6 @@ information. It includes a keymap for basic debugger control."
 (defun dapdbg-ui-mode--disable ()
   (dapdbg-ui--set-left-margin 0))
 
-(defvar dapdbg--source-breakpoints-alist nil
-  "List of source-code breakpoints for current or future debugging sessions.
-
-   Each entry is a cons pair of the form
-
-   (FILENAME . (BREAKPOINTS))
-
-   where filename is the full path to a source file, and
-   BREAKPOINTS is a list of plists which have the form given in
-   https://microsoft.github.io/debug-adapter-protocol/specification#Types_SourceBreakpoint")
-
 (defun dapdbg-ui--set-left-margin (width)
   (setq left-margin-width width)
   (let ((window (get-buffer-window (current-buffer) 0)))
@@ -139,24 +128,30 @@ information. It includes a keymap for basic debugger control."
       (tabulated-list-print))
     (display-buffer (car buf-created))))
 
-(defvar-keymap dapdbg-ui-locals-mode-map
-  :doc "Local keymap for `dapdbg-ui-locals-mode' buffers."
+(defvar-keymap dapdbg-ui-variables-mode-map
+  :doc "Local keymap for `dapdbg-ui-variables-mode' buffers."
   :parent tabulated-list-mode-map
   "TAB" #'dapdbg-ui--toggle-expand-variable)
+
+(defvar-keymap dapdbg-ui-locals-mode-map :parent dapdbg-ui-variables-mode-map)
 
 (define-derived-mode dapdbg-ui-locals-mode tabulated-list-mode "Var"
   "Major mode for local variables display"
   :interactive nil
   (setq tabulated-list-format
         (vector '("Name" 12 nil :right-align nil)
+                '("Type" 16 nil)
                 '("Value" 999 nil)))
   (tabulated-list-init-header))
+
+(defvar-keymap dapdbg-ui-registers-mode-map :parent dapdbg-ui-variables-mode-map)
 
 (define-derived-mode dapdbg-ui-registers-mode tabulated-list-mode "Reg"
   "Major mode for registers display"
   :interactive nil
   (setq tabulated-list-format
         (vector '("Name" 12 nil :right-align nil)
+                '("Type" 16 nil)
                 '("Value" 999 nil)))
   (tabulated-list-init-header))
 
@@ -178,10 +173,12 @@ information. It includes a keymap for basic debugger control."
                        (t "  ")))
          (pad-fmt (format "%%%ds%%s%%s" (* 2 depth)))
          (name (format pad-fmt "" switch (gethash "name" node)))
+         (type (format "%s" (gethash "type" node)))
          (value (format "%s" (gethash "value" node)))
          (id (gethash :id node))
          (entry (list id (vector
                           (propertize name 'face 'font-lock-variable-name-face) 
+                          (propertize type 'face 'font-lock-type-name-face) 
                           (propertize value 'face 'font-lock-number-face)))))
     (when my-children
       (dolist (child my-children)
