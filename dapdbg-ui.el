@@ -228,11 +228,11 @@ information. It includes a keymap for basic debugger control."
     (dolist (node nodes)
       (let ((result (dapdbg-ui--make-tablulated-list-entries-r node 0 (list))))
         (if target-list
-            (nconc target-list result)
+            (setq target-list (nconc result target-list))
           (setq target-list result))))
     target-list))
 
-(defun dapdbg-ui--variables-refresh (buf-name mode thing-list parent-id &optional reset-flag)
+(defun dapdbg-ui--variables-refresh (buf-name mode processor thing-list parent-id &optional reset-flag)
   (let ((buf-created (dapdbg--get-or-create-buffer buf-name))) 
     (when (cdr buf-created)
       (with-current-buffer (car buf-created)
@@ -240,6 +240,7 @@ information. It includes a keymap for basic debugger control."
         (font-lock-mode -1)
         ;; do this after setting the major mode
         (setq-local
+         var-processor processor
          var-counter 0
          var-root-list (list)
          var-map (make-hash-table :test 'equal))))
@@ -271,10 +272,9 @@ information. It includes a keymap for basic debugger control."
   (let* ((parent-id (or parent-id (tabulated-list-get-id)))
          (parent (gethash parent-id var-map))
          (var-id (gethash "variablesReference" parent))
-         (processor #'dapdbg-ui--locals-update)
          (handler (lambda (parsed-msg1)
                     (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                      (funcall processor parent-id vars)))))
+                      (funcall var-processor parent-id vars)))))
     (if (> (length (gethash :children parent)) 0)
         (dapdbg-ui--un-expand-variable parent)
       (if (> var-id 0)
@@ -282,9 +282,13 @@ information. It includes a keymap for basic debugger control."
         (warn "variable is not expandable")))))
 
 (defmacro dapdbg-ui--make-variables-update-fn (short-name docstring buf-name)
-  `(defun ,(intern (format "dapdbg-ui--%s-update" short-name)) (parent-id thing-list &optional reset-flag)
-     ,docstring
-     (dapdbg-ui--variables-refresh ,buf-name ',(intern (format "dapdbg-ui-%s-mode" short-name)) thing-list parent-id reset-flag)))
+  (let ((fn-symbol (intern (format "dapdbg-ui--%s-update" short-name))))
+    `(defun ,fn-symbol (parent-id thing-list &optional reset-flag)
+       ,docstring
+       (dapdbg-ui--variables-refresh ,buf-name '
+                                     ,(intern (format "dapdbg-ui-%s-mode" short-name))
+                                     ',fn-symbol
+                                     thing-list parent-id reset-flag))))
 
 (dapdbg-ui--make-variables-update-fn
  "globals"
