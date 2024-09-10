@@ -267,13 +267,16 @@ version 14 onwards.")
   (let ((tid (gethash "threadId" (gethash "body" msg))))
     (setf (dapdbg-session-thread-id dapdbg--ssn) tid)))
 
+
 (defun dapdbg--handle-response (parsed-msg)
-  (let* ((cb-seq (gethash "request_seq" parsed-msg))
-         (cb-table (dapdbg-session-callbacks dapdbg--ssn))
-         (cb (gethash cb-seq cb-table)))
-    (when cb
-      (remhash cb-seq cb-table)
-      (funcall cb parsed-msg))))
+  (if (not (gethash "success" parsed-msg))
+      (message "[%s] failed - %s" (gethash "command" parsed-msg) (gethash "message" parsed-msg))
+    (let* ((cb-seq (gethash "request_seq" parsed-msg))
+           (cb-table (dapdbg-session-callbacks dapdbg--ssn))
+           (cb (gethash cb-seq cb-table)))
+      (when cb
+        (remhash cb-seq cb-table)
+        (funcall cb parsed-msg)))))
 
 (defvar dapdbg--breakpoints-updated-callback-list nil
   "Functions to call when the this session's breakpoints have been
