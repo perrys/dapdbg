@@ -1,4 +1,5 @@
-;; dapdbg-ui.el --- User Interface for dapdbg -*- lexical-binding: t; -*-
+;; dapdbg-ui.el bottom User Interface for dapdbg -*- lexical-binding: t; -*-
+
 
 (require 'dapdbg)
 
@@ -77,7 +78,7 @@ information. It includes a keymap for basic debugger control."
   (tabulated-list-init-header))
 
 (defvar-keymap dapdbg-ui-stacktrace-mode-map
-  :doc "Local keymap for `Buffer-menu-mode' buffers."
+  :doc "Local keymap for `STrace' buffers."
   :parent tabulated-list-mode-map
   "RET" #'dapdbg-ui--switch-stackframe)
 
@@ -89,6 +90,18 @@ information. It includes a keymap for basic debugger control."
                 '("Function" 999 nil)))
   (tabulated-list-init-header))
 
+(defvar-keymap dapdbg-ui-output-mode-map
+  :doc "Local keymap for `dapdbg I/O' buffers.")
+
+(define-derived-mode dapdbg-ui-output-mode comint-mode "dbgIO"
+  "Major mode for the debugger REPL and process output"
+  :interactive nil
+  (setq comint-prompt-regexp "^>+ *"
+        comint-input-sender (lambda (_process cmd) (dapdbg-ui--eval-repl cmd) nil)
+        comint-process-echoes nil)
+  (let ((dummy-process (start-process "dapdbg-ui-repl" (current-buffer) nil)))
+    (set-process-query-on-exit-flag dummy-process nil)))
+
 ;; ------------------- commands ---------------------
 
 (defun dapdbg-ui-start-lldb (command-line)
@@ -98,6 +111,15 @@ information. It includes a keymap for basic debugger control."
 (defun dapdbg-ui-start-gdb (command-line)
   (interactive (list (read-shell-command "Target (command-line): ")))
   (dapdbg--start-gdb command-line))
+
+(defun dapdbg-ui--eval-repl (expr)
+  (interactive "sExpression: ")
+  (dapdbg--eval-repl
+   expr
+   (lambda (parsed-msg)
+     (dapdbg-ui--output (format "> %s\n" expr) "repl-input")
+     (dapdbg-ui--output (gethash "result" (gethash "body" parsed-msg)))
+     (dapdbg-ui--output ">> "))))
 
 ;; ------------------- margin stuff ---------------------
 
@@ -113,7 +135,7 @@ information. It includes a keymap for basic debugger control."
 (defun dapdbg-ui--make-margin-marker-properties (&optional breakpoint-p)
   (list (list 'margin 'left-margin) 
         (propertize (if breakpoint-p ">" "=>") 'face 'dapdbg-ui-arrow-face)))
-  
+
 (defun dapdbg-ui--make-marker-overlay (start end buf)
   (let ((olay (make-overlay start end))
         (invisible-str (make-string 1 ?x)))
@@ -167,7 +189,25 @@ information. It includes a keymap for basic debugger control."
       (let ((bp-overlays (cl-remove-if-not (lambda (olay) (eq (overlay-get olay :kind) 'breakpoint))
                                            (overlays-in (point-min) (point-max)))))
         (dolist (olay bp-overlays) (delete-overlay olay))))))
-    
+
+;; ------------------- input/output ---------------------
+
+(defun dapdbg-ui--output (data &optional category)
+  (let ((buf-created (dapdbg--get-or-create-buffer "*Output*"))) 
+    (when (cdr buf-created)
+      (with-current-buffer (car buf-created)
+        (dapdbg-ui-output-mode)
+        (font-lock-mode -1)))
+    (with-current-buffer (car buf-created)
+      (let ((sink (get-buffer-process (car buf-created))))
+        (if category
+            (pcase category
+              ("stderr" (setq data (propertize data 'face 'font-lock-warning-face)))
+              ("repl-input" (setq data (propertize data 'face 'font-lock-comment-face)))
+              ("repl-output" (setq data (propertize data 'face 'font-lock-string-face)))))
+        (process-send-string sink data)))
+    (display-buffer (car buf-created))))
+
 ;; ------------------- stacktrace ---------------------
 
 (defun dapdbg-ui--stacktrace-refresh (stacktrace)
@@ -315,7 +355,7 @@ information. It includes a keymap for basic debugger control."
         (if (hash-table-p bp-details)
             (dapdbg-ui--draw-breakpoint-marker buf linenumber (gethash "verified" bp-details))
           (dapdbg-ui--draw-breakpoint-marker buf linenumber nil))))))
-    
+
 (defun dapdbg-ui--refresh-breakpoints (filename bp-table)
   (let ((buf (get-file-buffer filename)))
     (when buf
@@ -356,6 +396,12 @@ information. It includes a keymap for basic debugger control."
         (dapdbg-ui-mode--set-marker buf linenumber)))
     (dapdbg-ui--stacktrace-refresh stack)))
 
+(defun dapdbg-ui--handle-output-event (parsed-msg)
+  (let ((body (gethash "body" parsed-msg)))
+    (dapdbg-ui--output (gethash "output" body) (gethash "category" body))))
+
+(add-hook 'dapdbg--output-callback-list #'dapdbg-ui--handle-output-event)
+
 (defun dapdbg-ui--handle-stopped-event (_parsed-msg)
   (dapdbg--stacktrace nil #'dapdbg-ui--handle-stacktrace-response))
 
@@ -370,6 +416,12 @@ information. It includes a keymap for basic debugger control."
 
 (defun dapdbg-ui-setup-many-windows ()
   (interactive)
+  (add-to-list
+   'display-buffer-alist
+   '((major-mode . dapdbg-ui-output-mode)
+     (display-buffer-in-side-window)
+     (side . bottom)
+     (slot . 1)))
   (add-to-list
    'display-buffer-alist
    '((major-mode . dapdbg-ui-stacktrace-mode)
@@ -387,6 +439,6 @@ information. It includes a keymap for basic debugger control."
    '((major-mode . dapdbg-ui-locals-mode)
      (display-buffer-in-side-window)
      (side . right)
-     (slot . 1))))
+     (slot . 3))))
 
 (provide 'dapdbg-ui)

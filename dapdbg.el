@@ -240,6 +240,9 @@ version 14 onwards.")
 (defun dapdbg--memory-dump (start-address count &optional callback)
   (dapdbg--send-request "readMemory" (list :memoryReference start-address :count count) callback))
 
+(defun dapdbg--eval-repl (expr &optional callback)
+  (dapdbg--send-request "evaluate" (list :expression expr :context "repl") callback))
+
 ;; ------------------- event handlers ---------------------
 
 (defvar dapdbg--breakpoints-updated-callback-list nil
