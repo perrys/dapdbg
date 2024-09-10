@@ -357,7 +357,7 @@ information. It includes a keymap for basic debugger control."
     (dapdbg-ui--stacktrace-refresh stack)))
 
 (defun dapdbg-ui--handle-stopped-event (_parsed-msg)
-  (dapdbg-stacktrace nil #'dapdbg-ui--handle-stacktrace-response))
+  (dapdbg--stacktrace nil #'dapdbg-ui--handle-stacktrace-response))
 
 (add-hook 'dapdbg--stopped-callback-list #'dapdbg-ui--handle-stopped-event)
 
