@@ -92,13 +92,19 @@ information. It includes a keymap for basic debugger control."
 
 (defvar-keymap dapdbg-ui-output-mode-map
   :doc "Local keymap for `dapdbg I/O' buffers."
-  "RET" #'dapdbg-ui--send-input)
+  "M-p" #'dapdbg-ui-previous-input
+  "RET" #'dapdbg-ui-send-input)
+
+(defcustom dapdbg-ui-input-ring-size 64
+  "Length of command-history for the I/O buffer"
+  :type 'integer)
 
 (define-derived-mode dapdbg-ui-output-mode fundamental-mode "dbgIO"
   "Major mode for the debugger REPL and process output"
   :interactive nil
   (setq-local dapdbg-ui--output-mark (point-min)
-              dapdbg-ui--io-prompt (propertize "(gdb)" 'read-only t 'face 'comint-highlight-prompt))
+              dapdbg-ui--io-prompt (propertize "(gdb)" 'read-only t 'face 'comint-highlight-prompt)
+              dapdbg-ui--input-ring (make-ring dapdbg-ui-input-ring-size))
   (insert (concat dapdbg-ui--io-prompt " "))
   (setq-local dapdbg-ui--input-mark (point-max)))
 
@@ -213,10 +219,27 @@ information. It includes a keymap for basic debugger control."
         (goto-char (point-max))))
     (display-buffer buf)))
 
-(defun dapdbg-ui--send-input ()
+(defun dapdbg-ui-previous-input (arg)
+  (interactive "*p")
+  (if (ring-empty-p dapdbg-ui--input-ring)
+      (message "no previous command")
+    (unless dapdbg-ui--input-ring-index
+      (let ((current-input (buffer-substring-no-properties dapdbg-ui--input-mark (point-max))))
+        (unless (string-empty-p current-input)
+          (setq-local dapdbg-ui--incomplete-input current-input)))
+      (setq-local dapdbg-ui--input-ring-index 1))
+    (let ((prev-input (ring-ref dapdbg-ui--input-ring dapdbg-ui--input-ring-index)))
+      (cl-incf dapdbg-ui--input-ring-index)
+      (delete-region dapdbg-ui--input-mark (point-max))
+      (goto-char dapdbg-ui--input-mark)
+      (insert prev-input))))
+
+(defun dapdbg-ui-send-input ()
   (interactive)
   (let ((input (buffer-substring-no-properties dapdbg-ui--input-mark (point-max))))
     (delete-region dapdbg-ui--input-mark (point-max))
+    (ring-insert dapdbg-ui--input-ring input)
+    (setq-local dapdbg-ui--input-ring-index nil)
     (dapdbg-ui--eval-repl input)))
 
 ;; ------------------- stacktrace ---------------------

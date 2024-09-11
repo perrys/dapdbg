@@ -60,6 +60,7 @@ version 14 onwards.")
   (process nil :read-only t)
   (callbacks (make-hash-table :test 'equal) :read-only t)
   (source-breakpoints (make-hash-table :test 'equal) :read-only t)
+  (prompt nil)
   (buffer "")
   (seq 0)
   (thread-id nil)
@@ -73,11 +74,13 @@ version 14 onwards.")
 (defconst dapdbg--lldb-plist
   (list :type "lldb-dap"
         :command-line-sym 'dapdbg-lldb-command-line
+        :prompt "(lldb)"
         :stop-on-entry-sym :stopOnEntry))
 
 (defconst dapdbg--gdb-plist
   (list :type "gdb-dap"
         :command-line-sym 'dapdbg-gdb-command-line
+        :prompt "(gdb)"
         :stop-on-entry-sym :stopAtBeginningOfMainSubprogram))
 
 (defun dapdbg--connect (command-line)
@@ -123,6 +126,7 @@ version 14 onwards.")
         ("y" (dapdbg-quit))
         (_ (error "Aborted"))))
     (dapdbg--connect (eval (plist-get debugger-plist :command-line-sym)))
+    (setf (dapdbg-session-prompt dapdbg--ssn) (plist-get debugger-plist :prompt))
     (dapdbg--launch-initialize (car toks) (cdr toks) debugger-plist)))
 
 (defun dapdbg--ready-p ()
