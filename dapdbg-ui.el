@@ -91,16 +91,16 @@ information. It includes a keymap for basic debugger control."
   (tabulated-list-init-header))
 
 (defvar-keymap dapdbg-ui-output-mode-map
-  :doc "Local keymap for `dapdbg I/O' buffers.")
+  :doc "Local keymap for `dapdbg I/O' buffers."
+  "RET" #'dapdbg-ui--send-input)
 
-(define-derived-mode dapdbg-ui-output-mode comint-mode "dbgIO"
+(define-derived-mode dapdbg-ui-output-mode fundamental-mode "dbgIO"
   "Major mode for the debugger REPL and process output"
   :interactive nil
-  (setq comint-prompt-regexp "^>+ *"
-        comint-input-sender (lambda (_process cmd) (dapdbg-ui--eval-repl cmd) nil)
-        comint-process-echoes nil)
-  (let ((dummy-process (start-process "dapdbg-ui-repl" (current-buffer) nil)))
-    (set-process-query-on-exit-flag dummy-process nil)))
+  (setq-local dapdbg-ui--output-mark (point-min)
+              dapdbg-ui--io-prompt (propertize "(gdb)" 'read-only t 'face 'comint-highlight-prompt))
+  (insert (concat dapdbg-ui--io-prompt " "))
+  (setq-local dapdbg-ui--input-mark (point-max)))
 
 ;; ------------------- commands ---------------------
 
@@ -118,8 +118,7 @@ information. It includes a keymap for basic debugger control."
    expr
    (lambda (parsed-msg)
      (dapdbg-ui--output (format "> %s\n" expr) "repl-input")
-     (dapdbg-ui--output (gethash "result" (gethash "body" parsed-msg)))
-     (dapdbg-ui--output ">> "))))
+     (dapdbg-ui--output (gethash "result" (gethash "body" parsed-msg))))))
 
 ;; ------------------- margin stuff ---------------------
 
@@ -162,7 +161,8 @@ information. It includes a keymap for basic debugger control."
                   (dapdbg-ui--make-marker-overlay bol eol buf)))
           (put-text-property 0 1 'display (dapdbg-ui--make-margin-marker-properties breakpointp)
                              (overlay-get dapdbg-ui--marker-overlay 'before-string))))))
-  (display-buffer buf))
+  (unless (get-buffer-window buf "visible")
+    (display-buffer buf)))
 
 (defun dapdbg-ui--draw-breakpoint-marker (buf linenumber verified)
   (with-current-buffer buf
@@ -193,20 +193,31 @@ information. It includes a keymap for basic debugger control."
 ;; ------------------- input/output ---------------------
 
 (defun dapdbg-ui--output (data &optional category)
-  (let ((buf-created (dapdbg--get-or-create-buffer "*Output*"))) 
+  (let* ((buf-created (dapdbg--get-or-create-buffer "*Input/Output*"))
+         (buf (car buf-created)))
     (when (cdr buf-created)
-      (with-current-buffer (car buf-created)
+      (with-current-buffer buf
         (dapdbg-ui-output-mode)
         (font-lock-mode -1)))
-    (with-current-buffer (car buf-created)
-      (let ((sink (get-buffer-process (car buf-created))))
-        (if category
-            (pcase category
-              ("stderr" (setq data (propertize data 'face 'font-lock-warning-face)))
-              ("repl-input" (setq data (propertize data 'face 'font-lock-comment-face)))
-              ("repl-output" (setq data (propertize data 'face 'font-lock-string-face)))))
-        (process-send-string sink data)))
-    (display-buffer (car buf-created))))
+    (with-current-buffer buf
+      (let ((props (list 'read-only t)))
+        (pcase category
+              ("stderr" (plist-put props 'face 'font-lock-warning-face))
+              ("repl-input" (plist-put props 'face 'font-lock-comment-face))
+              ("repl-output" (plist-put props 'face 'font-lock-string-face)))
+        (add-text-properties 0 (length data) props data)
+        (goto-char dapdbg-ui--output-mark)
+        (let ((inhibit-read-only t)) (insert data))
+        (setq-local dapdbg-ui--output-mark (+ dapdbg-ui--output-mark (length data))
+                    dapdbg-ui--input-mark (+ dapdbg-ui--input-mark (length data)))
+        (goto-char (point-max))))
+    (display-buffer buf)))
+
+(defun dapdbg-ui--send-input ()
+  (interactive)
+  (let ((input (buffer-substring-no-properties dapdbg-ui--input-mark (point-max))))
+    (delete-region dapdbg-ui--input-mark (point-max))
+    (dapdbg-ui--eval-repl input)))
 
 ;; ------------------- stacktrace ---------------------
 
@@ -390,7 +401,7 @@ information. It includes a keymap for basic debugger control."
     (when source
       (let* ((filename (gethash "path" source))
              (linenumber (gethash "line" (car stack)))
-             (buf (find-file filename)))
+             (buf (find-file-noselect filename)))
         (with-current-buffer buf
           (dapdbg-ui-mode t))
         (dapdbg-ui-mode--set-marker buf linenumber)))
