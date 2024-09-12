@@ -6,9 +6,7 @@
 (require 'dapdbg-ui)
 
 (defun dapdbg-ui-test-create-tree ()
-  (let ((counter 0)
-        (root (list))
-        (var-map (make-hash-table :test 'equal))
+  (let ((tree (make-dapdbg-ui--var-tree))
         (msgs (mapcar (lambda (msg) (gethash "variables" (dapdbg--parse-json msg))) '("
 {
     \"variables\": [
@@ -39,21 +37,37 @@
     ]
 }
 "))))
-    (dapdbg-ui--add-to-variables-tree (car msgs) nil 'root 'counter var-map)
-    (dapdbg-ui--add-to-variables-tree (cadr msgs) 1 'root 'counter var-map)
-    (list :root root :counter counter :map var-map)))
+    (dapdbg-ui--add-to-variables-tree "Locals" (car msgs) tree)
+    (dapdbg-ui--add-to-variables-tree "Locals/args" (cadr msgs) tree)
+    tree))
 
 
 (ert-deftest can-create-tree ()
-  (pcase-let ((`(:root ,root :counter ,counter :map ,var-map) (dapdbg-ui-test-create-tree)))
-    (should (eq 3 (hash-table-count var-map)))
-    (should (eq 1 (length root)))
-    (let ((children (reverse (gethash :children (car root)))))
-      (should (equal "foo" (gethash "value" (car children))))
-      (should (equal "bar" (gethash "value" (cadr children)))))
-    ))
+  (let* ((mytree (dapdbg-ui-test-create-tree))
+         (mytable (dapdbg-ui--var-tree-table mytree))
+         (root-ids (dapdbg-ui--var-tree-root-ids mytree)))
+    (should (eq 3 (hash-table-count mytable)))
+    (should (eq 1 (length root-ids)))
+    (let ((child-ids (reverse (gethash :child-ids (gethash (car root-ids) mytable)))))
+      (should (equal "foo" (gethash "value" (dapdbg-ui--get-var (car child-ids) mytree))))
+      (should (equal "bar" (gethash "value" (dapdbg-ui--get-var (cadr child-ids) mytree)))))))
 
 (ert-deftest can-serialize-tree ()
-  (pcase-let ((`(:root ,root :counter ,counter :map ,var-map) (dapdbg-ui-test-create-tree)))
-  (let ((result (dapdbg-ui--make-tablulated-list-entries root)))
-    (message "result1 = %s" result))))  ;
+  (let ((mytree (dapdbg-ui-test-create-tree)))
+    (let ((result (dapdbg-ui--make-variables-list mytree)))
+      (should result)
+      (should (eq 3 (length result)))
+      (should (equal "Locals/args" (car (nth 0 result))))
+      (should (equal "Locals/args/[0]" (car (nth 1 result))))
+      (should (equal "Locals/args/[1]" (car (nth 2 result)))))))
+
+(ert-deftest can-update-tree ()
+  (let* ((mytree (dapdbg-ui-test-create-tree))
+         (mytable (dapdbg-ui--var-tree-table mytree))
+         (updates (dapdbg-ui--add-to-variables-tree
+                   "Locals" (list (copy-hash-table (gethash "Locals/args" mytable))) mytree)))
+    (should (eq 1 (length updates)))
+    (should (equal (cons "Locals/args"  3) (car updates)))))
+
+    
+

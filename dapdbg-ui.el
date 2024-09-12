@@ -151,24 +151,29 @@ information. It includes a keymap for basic debugger control."
     olay))
 
 (defun dapdbg-ui-mode--set-marker (buf linenumber)
-  (with-current-buffer buf
-    (save-excursion
-      (save-restriction
-        (widen)
-        (goto-char (point-min))
-        (forward-line (1- linenumber))
-        (let* ((bol (line-beginning-position))
-               (eol (line-end-position))
-               (breakpointp (cl-some (lambda (olay) (eq (overlay-get olay :kind) 'breakpoint))
-                                     (overlays-in bol eol))))
-          (if dapdbg-ui--marker-overlay
-              (move-overlay dapdbg-ui--marker-overlay bol eol buf) 
-            (setq dapdbg-ui--marker-overlay
-                  (dapdbg-ui--make-marker-overlay bol eol buf)))
-          (put-text-property 0 1 'display (dapdbg-ui--make-margin-marker-properties breakpointp)
-                             (overlay-get dapdbg-ui--marker-overlay 'before-string))))))
-  (unless (get-buffer-window buf "visible")
-    (display-buffer buf)))
+  (let ((bol 0))
+    (with-current-buffer buf
+      (save-excursion
+        (save-restriction
+          (widen)
+          (goto-char (point-min))
+          (forward-line (1- linenumber))
+          (setq bol (line-beginning-position))
+          (let* ((eol (line-end-position))
+                 (breakpointp (cl-some (lambda (olay) (eq (overlay-get olay :kind) 'breakpoint))
+                                       (overlays-in bol eol))))
+            (if dapdbg-ui--marker-overlay
+                (move-overlay dapdbg-ui--marker-overlay bol eol buf) 
+              (setq dapdbg-ui--marker-overlay
+                    (dapdbg-ui--make-marker-overlay bol eol buf)))
+            (put-text-property 0 1 'display (dapdbg-ui--make-margin-marker-properties breakpointp)
+                               (overlay-get dapdbg-ui--marker-overlay 'before-string))))))
+    (unless (get-buffer-window buf "visible")
+      (display-buffer buf))
+    (with-selected-window (get-buffer-window buf)
+      (unless (pos-visible-in-window-p bol)
+        (goto-char bol)
+        (recenter)))))
 
 (defun dapdbg-ui--draw-breakpoint-marker (buf linenumber verified)
   (with-current-buffer buf
@@ -208,9 +213,9 @@ information. It includes a keymap for basic debugger control."
     (with-current-buffer buf
       (let ((props (list 'read-only t)))
         (pcase category
-              ("stderr" (plist-put props 'face 'font-lock-warning-face))
-              ("repl-input" (plist-put props 'face 'font-lock-comment-face))
-              ("repl-output" (plist-put props 'face 'font-lock-string-face)))
+          ("stderr" (plist-put props 'face 'font-lock-warning-face))
+          ("repl-input" (plist-put props 'face 'font-lock-comment-face))
+          ("repl-output" (plist-put props 'face 'font-lock-string-face)))
         (add-text-properties 0 (length data) props data)
         (goto-char dapdbg-ui--output-mark)
         (let ((inhibit-read-only t)) (insert data))
@@ -266,19 +271,42 @@ information. It includes a keymap for basic debugger control."
 
 ;; ------------------- variables & registers ---------------------
 
-(defun dapdbg-ui--add-to-variables-tree (thing-list parent-id root-list-sym id-sym var-map)
-  (let ((parent (gethash parent-id var-map)))
-    (dolist (thing thing-list)
-      (let ((id (set id-sym (1+ (symbol-value id-sym)))))
-        (puthash id thing var-map)
-        (puthash :id id thing)
-        (puthash :children (list) thing))
-      (if parent
-          (push thing (gethash :children parent))
-        (add-to-list root-list-sym thing)))))
+(cl-defstruct dapdbg-ui--var-tree
+  "Holds the tree structure of variables data"
+  (root-ids (list))
+  (table (make-hash-table :test 'equal)))
 
-(defun dapdbg-ui--make-tablulated-list-entries-r (node depth target-list)
-  (let* ((my-children (gethash :children node))
+(defun dapdbg-ui--get-var (id var-tree)
+  "Convenience fn to get a variable's data from the tree structure" 
+  (gethash id (dapdbg-ui--var-tree-table var-tree)))
+
+(defun dapdbg-ui--add-to-variables-tree (parent-id thing-list var-tree)
+  "Add the given list of variables to the tree structure held in VAR-TREE."
+  (let* ((var-table (dapdbg-ui--var-tree-table var-tree))
+         (parent (gethash parent-id var-table))
+         (reload-ids (list)))
+    (dolist (thing thing-list)
+      (let* ((id (concat parent-id "/" (gethash "name" thing)))
+             (old-entry (gethash id var-table)))
+        (puthash id thing var-table)
+        (puthash :id id thing)
+        (puthash :child-ids (list) thing)
+        (when (and old-entry (gethash :child-ids old-entry))
+          (let ((var-ref (gethash "variablesReference" thing)))
+            (when (> var-ref 0)
+              (push (cons id var-ref) reload-ids))))
+        (if parent
+            (push id (gethash :child-ids parent))
+          (unless (cl-find id (dapdbg-ui--var-tree-root-ids var-tree) :test 'equal) ;; TODO - I think this is O(N^2)
+            (push id (dapdbg-ui--var-tree-root-ids var-tree))))))
+    reload-ids))
+
+(defun dapdbg-ui--make-variables-list-r (id var-table depth target-list)
+  "Construct the variables list by recursing through the tree
+structure starting from the node in VAR-TABLE with key ID,
+pushing each item to TARGET-LIST."
+  (let* ((node (gethash id var-table))
+         (my-children (gethash :child-ids node))
          (switch (cond ((not (seq-empty-p my-children)) "- ")
                        ((> (gethash "variablesReference" node) 0) "+ ")
                        (t "  ")))
@@ -286,27 +314,55 @@ information. It includes a keymap for basic debugger control."
          (name (format pad-fmt "" switch (gethash "name" node)))
          (type (format "%s" (gethash "type" node)))
          (value (format "%s" (gethash "value" node)))
-         (id (gethash :id node))
          (entry (list id (vector
                           (propertize name 'face 'font-lock-variable-name-face) 
                           (propertize type 'face 'font-lock-type-face) 
                           (propertize value 'face 'font-lock-string-face)))))
     (when my-children
-      (dolist (child my-children)
-        (setq target-list (dapdbg-ui--make-tablulated-list-entries-r child (1+ depth) target-list))))
-    (push entry target-list)
+      (dolist (child-id my-children)
+        (setq target-list (dapdbg-ui--make-variables-list-r child-id var-table (1+ depth) target-list))))
+    (cons entry target-list)))
+
+(defun dapdbg-ui--make-variables-list (var-tree)
+  "Make a list of the form required for `tabulated-list-entries' from
+the root IDs list and hash table of VAR-TREE"
+  (let ((target-list (list))
+        (root-ids (dapdbg-ui--var-tree-root-ids var-tree))
+        (var-map (dapdbg-ui--var-tree-table var-tree)))
+    (dolist (id root-ids)
+      (setq target-list (dapdbg-ui--make-variables-list-r id var-map 0 target-list)))
     target-list))
 
-(defun dapdbg-ui--make-tablulated-list-entries (nodes)
-  (let ((target-list (list)))
-    (dolist (node nodes)
-      (let ((result (dapdbg-ui--make-tablulated-list-entries-r node 0 (list))))
-        (if target-list
-            (setq target-list (nconc result target-list))
-          (setq target-list result))))
-    target-list))
+(defun dapdbg-ui--un-expand-variable (parent)
+  (puthash :child-ids (list) parent)
+  (dapdbg-ui--refresh-variables-display))
 
-(defun dapdbg-ui--variables-refresh (buf-name mode processor thing-list parent-id &optional reset-flag)
+(defun dapdbg-ui--refresh-variables-display ()
+  "Render variables in the current tabulated-list buffer"
+  (setq tabulated-list-entries (dapdbg-ui--make-variables-list var-tree))
+  (let ((point (point)))
+    (tabulated-list-print)
+    (goto-char point)))
+
+(defun dapdbg-ui--toggle-expand-variable ()
+  "Expand or un-expand the variable for the row at point in the tabulated-list
+of the current buffer."
+  (interactive)
+  (unless var-tree
+    (error "not in a variables window"))
+  (let* ((parent-id (tabulated-list-get-id))
+         (parent (dapdbg-ui--get-var parent-id var-tree))
+         (var-id (gethash "variablesReference" parent))
+         (handler (lambda (parsed-msg1)
+                    (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
+                      (funcall var-processor parent-id vars)))))
+    (if (> (length (gethash :child-ids parent)) 0)
+        (dapdbg-ui--un-expand-variable parent)
+      (if (> var-id 0)
+          (dapdbg--variables var-id handler)
+        (warn "variable is not expandable")))))
+
+(defun dapdbg-ui--variables-refresh (parent-id thing-list buf-name mode processor &optional reset-flag)
   (let ((buf-created (dapdbg--get-or-create-buffer buf-name))) 
     (when (cdr buf-created)
       (with-current-buffer (car buf-created)
@@ -315,54 +371,36 @@ information. It includes a keymap for basic debugger control."
         ;; do this after setting the major mode
         (setq-local
          var-processor processor
-         var-counter 0
-         var-root-list (list)
-         var-map (make-hash-table :test 'equal))))
+         var-tree (make-dapdbg-ui--var-tree))))
     (with-current-buffer (car buf-created)
       (when reset-flag
-        (setq-local
-         var-counter 0
-         var-root-list (list))
-        (clrhash var-map))
-      (dapdbg-ui--add-to-variables-tree thing-list parent-id 'var-root-list 'var-counter var-map)
-      (setq tabulated-list-entries (dapdbg-ui--make-tablulated-list-entries var-root-list))
-      (let ((point (point)))
-        (tabulated-list-print)
-        (goto-char point)))
+        (let ((var-map (dapdbg-ui--var-tree-table var-tree)))
+          (dolist (id (dapdbg-ui--var-tree-root-ids var-tree))
+            (let ((var-obj (gethash id var-map)))
+              (puthash "value" "_" var-obj)
+              (puthash "type" "<invalid>" var-obj)
+              (puthash :child-ids nil var-obj)))))
+      (let ((reload-ids (dapdbg-ui--add-to-variables-tree parent-id thing-list var-tree)))
+        (if reload-ids
+            (dolist (reload reload-ids)
+              (let* ((parent-id (car reload))
+                     (var-ref (cdr reload))
+                     (handler (lambda (parsed-msg1)
+                                (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
+                                  (funcall processor parent-id vars)))))
+                (dapdbg--variables var-ref handler)))
+          (dapdbg-ui--refresh-variables-display)))) ; at a leaf node
     (display-buffer (car buf-created))))
-
-(defun dapdbg-ui--un-expand-variable (parent)
-  (puthash :children (list) parent)
-  (setq tabulated-list-entries (dapdbg-ui--make-tablulated-list-entries var-root-list))
-  (let ((point (point)))
-    (tabulated-list-print)
-    (goto-char point)))
-
-(defun dapdbg-ui--toggle-expand-variable (&optional parent-id)
-  "Expand or un-expand the variable for the row at point in the tabulated-list."
-  (interactive)
-  (unless var-map
-    (error "not in a variables window"))
-  (let* ((parent-id (or parent-id (tabulated-list-get-id)))
-         (parent (gethash parent-id var-map))
-         (var-id (gethash "variablesReference" parent))
-         (handler (lambda (parsed-msg1)
-                    (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                      (funcall var-processor parent-id vars)))))
-    (if (> (length (gethash :children parent)) 0)
-        (dapdbg-ui--un-expand-variable parent)
-      (if (> var-id 0)
-          (dapdbg--variables var-id handler)
-        (warn "variable is not expandable")))))
 
 (defmacro dapdbg-ui--make-variables-update-fn (short-name docstring buf-name)
   (let ((fn-symbol (intern (format "dapdbg-ui--%s-update" short-name))))
     `(defun ,fn-symbol (parent-id thing-list &optional reset-flag)
        ,docstring
-       (dapdbg-ui--variables-refresh ,buf-name '
+       (dapdbg-ui--variables-refresh parent-id thing-list
+                                     ,buf-name '
                                      ,(intern (format "dapdbg-ui-%s-mode" short-name))
                                      ',fn-symbol
-                                     thing-list parent-id reset-flag))))
+                                     reset-flag))))
 
 (dapdbg-ui--make-variables-update-fn
  "globals"
@@ -412,7 +450,7 @@ information. It includes a keymap for basic debugger control."
           (when processor
             (let ((handler (lambda (parsed-msg1)
                              (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                               (funcall processor nil vars t)))))
+                               (funcall processor kind vars t)))))
               (dapdbg--variables id handler))))))))
 
 (defun dapdbg-ui--handle-stacktrace-response (parsed-msg)
