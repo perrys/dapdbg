@@ -196,7 +196,7 @@ information. It includes a keymap for basic debugger control."
                                            (overlays-in (point-min) (point-max)))))
         (dolist (olay bp-overlays) (delete-overlay olay))))))
 
-;; ------------------- input/output ---------------------
+;; ------------------- REPL and I/O ---------------------
 
 (defun dapdbg-ui--output (data &optional category)
   (let* ((buf-created (dapdbg--get-or-create-buffer "*Input/Output*"))
@@ -464,15 +464,22 @@ information. It includes a keymap for basic debugger control."
      (slot . 1)))
   (add-to-list
    'display-buffer-alist
+   '((major-mode . dapdbg-ui-locals-mode)
+     (display-buffer-in-side-window)
+     (side . right)
+     (slot . 1)))
+  (add-to-list
+   'display-buffer-alist
    '((major-mode . dapdbg-ui-registers-mode)
      (display-buffer-in-side-window)
      (side . right)
      (slot . 2)))
   (add-to-list
    'display-buffer-alist
-   '((major-mode . dapdbg-ui-locals-mode)
+   '((major-mode . dapdbg-ui-globals-mode)
      (display-buffer-in-side-window)
      (side . right)
-     (slot . 3))))
+     (slot . 3)))
+  )
 
 (provide 'dapdbg-ui)
