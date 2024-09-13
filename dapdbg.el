@@ -51,8 +51,13 @@ The GDB debugger implements the DAP interface with the
 command-line flags '-i dap'. Note that GDB supports DAP from
 version 14 onwards.")
 
-(defvar dapdbg-launch-args nil
-  "Additional properties to pass to the launch command (debugger dependent).")
+(defvar dapdbg-lldb-init-commands
+  '("command script import ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/etc/lldb_lookup.py"
+    "command source ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/etc/lldb_commands")
+  "Additional properties to pass to the launch command.")
+
+(defvar dapdbg-gdb-init-commands nil
+  "Additional properties to pass to the launch command.")
 
 ;; ------------------- initialization and session ---------------------
 
@@ -64,6 +69,7 @@ breakpoints and latest thread/stack state when stopped."
   (callbacks (make-hash-table :test 'equal) :read-only t)
   (source-breakpoints (make-hash-table :test 'equal) :read-only t)
   (prompt nil)
+  (sends-initialized-event t)
   (buffer "")
   (seq 0)
   (thread-id nil)
@@ -77,6 +83,8 @@ breakpoints and latest thread/stack state when stopped."
 (defconst dapdbg--lldb-plist
   (list :type "lldb-dap"
         :command-line-sym 'dapdbg-lldb-command-line
+        :init-commands-sym 'dapdbg-lldb-init-commands
+        :sends-initialized-event nil
         :prompt "(lldb)"
         :stop-on-entry-sym :stopOnEntry)
   "Configuration specific to the LLDB debugger.")
@@ -84,6 +92,8 @@ breakpoints and latest thread/stack state when stopped."
 (defconst dapdbg--gdb-plist
   (list :type "gdb-dap"
         :command-line-sym 'dapdbg-gdb-command-line
+        :init-commands-sym 'dapdbg-gdb-init-commands
+        :sends-initialized-event t
         :prompt "(gdb)"
         :stop-on-entry-sym :stopAtBeginningOfMainSubprogram)
   "Configuration specific to the GDB debugger.")
@@ -116,9 +126,12 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
                     :type (plist-get debugger-plist :type)
                     :request "launch"
                     :program (expand-file-name program)
-                    (plist-get debugger-plist :stop-on-entry-sym) t)))
+                    (plist-get debugger-plist :stop-on-entry-sym) t))
+        (init-commands (symbol-value (plist-get debugger-plist :init-commands-sym))))
     (when program-arguments
       (plist-put arguments :args program-arguments))
+    (when init-commands
+      (plist-put arguments :initCommands init-commands))
     (setf (dapdbg-session-launch-args dapdbg--ssn) arguments))
   (let ((args (list
                :clientID "dapdbg"
@@ -129,7 +142,8 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
                :columnsStartAt1 t
                :supportsVariableType t
                :supportsVariablePaging t
-               :supportsRunInTerminalRequest t
+               :supportsRunInTerminalRequest nil
+               :supportsMemoryReferences t
                :locale "en-us")))
     (dapdbg--send-request "initialize" args #'dapdbg--handle-initialize-response)))
 
@@ -142,8 +156,9 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
       (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
         ("y" (dapdbg-quit))
         (_ (error "Aborted"))))
-    (dapdbg--connect (eval (plist-get debugger-plist :command-line-sym)))
+    (dapdbg--connect (symbol-value (plist-get debugger-plist :command-line-sym)))
     (setf (dapdbg-session-prompt dapdbg--ssn) (plist-get debugger-plist :prompt))
+    (setf (dapdbg-session-sends-initialized-event dapdbg--ssn) (plist-get debugger-plist :sends-initialized-event))
     (dapdbg--request-initialize (car toks) (cdr toks) debugger-plist)))
 
 (defun dapdbg--start-lldb (command-line)
@@ -165,8 +180,17 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
       (unless (gethash cap caps)
         (dapdbg-disconnect)
         (error "Debugger does not have capability \"%s\"" cap)))
-    ;; now wait for initialized event
-    (setf (dapdbg-session-capabilities dapdbg--ssn) caps)))
+    (setf (dapdbg-session-capabilities dapdbg--ssn) caps))
+  (unless (dapdbg-session-sends-initialized-event dapdbg--ssn)
+    ;; For GDB we just wait for the initialized event, but LLDB seems to require
+    ;; things in an order which doesn't match the spec
+    (dapdbg--set-all-breakpoints #'dapdbg--request-launch-then-configuration-done)))
+
+(defun dapdbg--request-launch-then-configuration-done ()
+  (let ((args (dapdbg-session-launch-args dapdbg--ssn)))
+    (dapdbg--send-request "launch" args
+                          (lambda (_msg)
+                            (dapdbg--send-request "configurationDone" nil #'dapdbg--handle-response-configdone)))))
 
 (defun dapdbg--request-launch ()
   (let ((args (dapdbg-session-launch-args dapdbg--ssn)))
@@ -174,16 +198,18 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
 
 (defun dapdbg--handle-response-configdone (msg)
   (setf (dapdbg-session-config-done dapdbg--ssn) t)
-  (dapdbg--request-launch))
+  (when (dapdbg-session-sends-initialized-event dapdbg--ssn)
+    (dapdbg--request-launch)))
 
 (defun dapdbg--request-configuration-done ()
   "At then end of the initialization sequence, send \"configurationDone\" and do launch afterwards."
   (dapdbg--send-request "configurationDone" nil #'dapdbg--handle-response-configdone))
 
-(defun dapdbg--handle-event-initialized (_parsed-msg)
+(defun dapdbg--handle-event-initialized (parsed-msg)
   "Once the intialized event is recieved - set any breakpoints, then
 proceed with the initialization sequence."
-  (dapdbg--set-all-breakpoints #'dapdbg--request-configuration-done))
+  (when (dapdbg-session-sends-initialized-event dapdbg--ssn)
+    (dapdbg--set-all-breakpoints #'dapdbg--request-configuration-done)))
 
 (defun dapdbg--initialized-p ()
   "Check that the debugger is alive and has initialized. See
