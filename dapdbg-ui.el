@@ -138,7 +138,7 @@ information. It includes a keymap for basic debugger control."
          window left-margin-width right-margin-width))))
 
 (defun dapdbg-ui--make-margin-marker-properties (&optional breakpoint-p)
-  (list (list 'margin 'left-margin) 
+  (list (list 'margin 'left-margin)
         (propertize (if breakpoint-p ">" "=>") 'face 'dapdbg-ui-arrow-face)))
 
 (defun dapdbg-ui--make-marker-overlay (start end buf)
@@ -163,7 +163,7 @@ information. It includes a keymap for basic debugger control."
                  (breakpointp (cl-some (lambda (olay) (eq (overlay-get olay :kind) 'breakpoint))
                                        (overlays-in bol eol))))
             (if dapdbg-ui--marker-overlay
-                (move-overlay dapdbg-ui--marker-overlay bol eol buf) 
+                (move-overlay dapdbg-ui--marker-overlay bol eol buf)
               (setq dapdbg-ui--marker-overlay
                     (dapdbg-ui--make-marker-overlay bol eol buf)))
             (put-text-property 0 1 'display (dapdbg-ui--make-margin-marker-properties breakpointp)
@@ -186,7 +186,7 @@ information. It includes a keymap for basic debugger control."
           (let ((olay (make-overlay (point) (point)))
                 (invisible-str (make-string 1 ?x))
                 (marker-display-properties
-                 (list (list 'margin 'left-margin) 
+                 (list (list 'margin 'left-margin)
                        (propertize marker 'face 'dapdbg-ui-breakpoint-face))))
             (put-text-property 0 1 'display marker-display-properties invisible-str)
             (overlay-put olay 'before-string invisible-str)
@@ -250,7 +250,7 @@ information. It includes a keymap for basic debugger control."
 ;; ------------------- stacktrace ---------------------
 
 (defun dapdbg-ui--stacktrace-refresh (stacktrace)
-  (let ((buf-created (dapdbg--get-or-create-buffer "*Stack*"))) 
+  (let ((buf-created (dapdbg--get-or-create-buffer "*Stack*")))
     (when (cdr buf-created)
       (with-current-buffer (car buf-created)
         (dapdbg-ui-stacktrace-mode)
@@ -263,7 +263,7 @@ information. It includes a keymap for basic debugger control."
                      (iptr (substring (gethash "instructionPointerReference" frame) 2))
                      (name (gethash "name" frame)))
                  (list id (vector
-                           (propertize iptr 'face 'font-lock-number-face) 
+                           (propertize iptr 'face 'font-lock-number-face)
                            (propertize name 'face 'font-lock-function-name-face)))))
              stacktrace))
       (tabulated-list-print))
@@ -272,27 +272,35 @@ information. It includes a keymap for basic debugger control."
 ;; ------------------- variables & registers ---------------------
 
 (cl-defstruct dapdbg-ui--var-tree
-  "Holds the tree structure of variables data"
+  "Holds the tree structure of variables data. The hash table holds
+all variable objects (for a particular stack frame) keyed by
+their path in the tree, and the tree structure is formed via the
+`:child-ids` property of each variable data object, which point
+to entries in the hash table."
   (root-ids (list))
   (table (make-hash-table :test 'equal)))
 
 (defun dapdbg-ui--get-var (id var-tree)
-  "Convenience fn to get a variable's data from the tree structure" 
+  "Convenience fn to get a variable's data from the tree structure"
   (gethash id (dapdbg-ui--var-tree-table var-tree)))
 
-(defun dapdbg-ui--add-to-variables-tree (parent-id thing-list var-tree)
-  "Add the given list of variables to the tree structure held in VAR-TREE."
+(defun dapdbg-ui--add-to-variables-tree (parent-id child-list var-tree)
+  "Add variables from CHILD-LIST to the tree structure held in
+VAR-TREE. Return the subset of ids from CHILD-LIST which had
+children at the last stop-point, and therefore need additional
+reloading."
   (let* ((var-table (dapdbg-ui--var-tree-table var-tree))
          (parent (gethash parent-id var-table))
          (reload-ids (list)))
-    (dolist (thing thing-list)
-      (let* ((id (concat parent-id "/" (gethash "name" thing)))
+    (dolist (child-var child-list)
+      (let* ((id (concat parent-id "/" (gethash "name" child-var)))
              (old-entry (gethash id var-table)))
-        (puthash id thing var-table)
-        (puthash :id id thing)
-        (puthash :child-ids (list) thing)
+        (puthash id child-var var-table)
+        (puthash :valid t child-var)
+        (puthash :id id child-var)
+        (puthash :child-ids (list) child-var)
         (when (and old-entry (gethash :child-ids old-entry))
-          (let ((var-ref (gethash "variablesReference" thing)))
+          (let ((var-ref (gethash "variablesReference" child-var)))
             (when (> var-ref 0)
               (push (cons id var-ref) reload-ids))))
         (if parent
@@ -301,36 +309,37 @@ information. It includes a keymap for basic debugger control."
             (push id (dapdbg-ui--var-tree-root-ids var-tree))))))
     reload-ids))
 
-(defun dapdbg-ui--make-variables-list-r (id var-table depth target-list)
-  "Construct the variables list by recursing through the tree
+(defun dapdbg-ui--make-variables-tabulated-list-r (id var-table depth target-list)
+  "Construct a list for display by recursing through the tree
 structure starting from the node in VAR-TABLE with key ID,
 pushing each item to TARGET-LIST."
   (let* ((node (gethash id var-table))
          (my-children (gethash :child-ids node))
+         (valid (gethash :valid node))
          (switch (cond ((not (seq-empty-p my-children)) "- ")
                        ((> (gethash "variablesReference" node) 0) "+ ")
                        (t "  ")))
          (pad-fmt (format "%%%ds%%s%%s" (* 2 depth)))
          (name (format pad-fmt "" switch (gethash "name" node)))
-         (type (format "%s" (gethash "type" node)))
-         (value (format "%s" (gethash "value" node)))
+         (type (format "%s" (if valid (gethash "type" node) "<invalid>")))
+         (value (format "%s" (if valid (gethash "value" node) "_")))
          (entry (list id (vector
-                          (propertize name 'face 'font-lock-variable-name-face) 
-                          (propertize type 'face 'font-lock-type-face) 
+                          (propertize name 'face 'font-lock-variable-name-face)
+                          (propertize type 'face 'font-lock-type-face)
                           (propertize value 'face 'font-lock-string-face)))))
     (when my-children
       (dolist (child-id my-children)
-        (setq target-list (dapdbg-ui--make-variables-list-r child-id var-table (1+ depth) target-list))))
+        (setq target-list (dapdbg-ui--make-variables-tabulated-list-r child-id var-table (1+ depth) target-list))))
     (cons entry target-list)))
 
-(defun dapdbg-ui--make-variables-list (var-tree)
+(defun dapdbg-ui--make-variables-tabulated-list (var-tree)
   "Make a list of the form required for `tabulated-list-entries' from
 the root IDs list and hash table of VAR-TREE"
   (let ((target-list (list))
         (root-ids (dapdbg-ui--var-tree-root-ids var-tree))
         (var-map (dapdbg-ui--var-tree-table var-tree)))
     (dolist (id root-ids)
-      (setq target-list (dapdbg-ui--make-variables-list-r id var-map 0 target-list)))
+      (setq target-list (dapdbg-ui--make-variables-tabulated-list-r id var-map 0 target-list)))
     target-list))
 
 (defun dapdbg-ui--un-expand-variable (parent)
@@ -339,64 +348,87 @@ the root IDs list and hash table of VAR-TREE"
 
 (defun dapdbg-ui--refresh-variables-display ()
   "Render variables in the current tabulated-list buffer"
-  (setq tabulated-list-entries (dapdbg-ui--make-variables-list var-tree))
-  (let ((point (point)))
-    (tabulated-list-print)
-    (goto-char point)))
+  (let ((var-tree (dapdbg-ui--get-tree-for-frame current-frame-id)))
+    (setq tabulated-list-entries (dapdbg-ui--make-variables-tabulated-list var-tree))
+    (let ((point (point)))
+      (tabulated-list-print)
+      (goto-char point))))
 
 (defun dapdbg-ui--toggle-expand-variable ()
   "Expand or un-expand the variable for the row at point in the tabulated-list
 of the current buffer."
   (interactive)
-  (unless var-tree
-    (error "not in a variables window"))
+  (unless tree-table
+    (error "not in a variables buffer"))
   (let* ((parent-id (tabulated-list-get-id))
+         (var-tree (dapdbg-ui--get-tree-for-frame current-frame-id))
          (parent (dapdbg-ui--get-var parent-id var-tree))
          (var-id (gethash "variablesReference" parent))
          (handler (lambda (parsed-msg1)
                     (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                      (funcall var-processor parent-id vars)))))
+                      (funcall var-update-fn current-frame-id parent-id vars)))))
     (if (> (length (gethash :child-ids parent)) 0)
         (dapdbg-ui--un-expand-variable parent)
       (if (> var-id 0)
           (dapdbg--variables var-id handler)
         (warn "variable is not expandable")))))
 
-(defun dapdbg-ui--variables-refresh (parent-id thing-list buf-name mode processor &optional reset-flag)
-  (let ((buf-created (dapdbg--get-or-create-buffer buf-name))) 
-    (when (cdr buf-created)
+(defun dapdbg-ui--get-tree-for-frame (frame-id)
+  "Get the dapdbg-ui--var-tree structure for the given frame, using
+the local hash table for the current buffer."
+  (let ((tree (gethash frame-id tree-table)))
+    (unless tree
+      (setq tree (puthash frame-id (make-dapdbg-ui--var-tree) tree-table)))
+    tree))
+
+(defun dapdbg-ui--reload-child-vars (reload-ids)
+  "Request variable data for the variables specified in RELOAD-IDS,
+each of which is a cons-pair of parent-path and the reference id
+provided by the DAP server."
+  (unless (and var-update-fn current-frame-id)
+    (error "not in a variables buffer"))
+  (let ((frame-id current-frame-id)
+        (update-fn var-update-fn))
+    (dolist (reload reload-ids)
+      (let* ((parent-id (car reload))
+             (var-ref (cdr reload))
+             (handler (lambda (parsed-msg1)
+                        (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
+                          (funcall update-fn frame-id parent-id vars)))))
+        (dapdbg--variables var-ref handler)))))
+
+(defun dapdbg-ui--variables-refresh (frame-id parent-id child-list buf-name mode update-fn &optional reset-flag)
+  "Update the tree structure for FRAME-ID with children of variable
+PARENT-ID provided in CHILD-LIST."
+  (let ((buf-created (dapdbg--get-or-create-buffer buf-name)))
+    (when (cdr buf-created) ; freshly-opened variables buffer
       (with-current-buffer (car buf-created)
         (funcall mode)
         (font-lock-mode -1)
         ;; do this after setting the major mode
         (setq-local
-         var-processor processor
-         var-tree (make-dapdbg-ui--var-tree))))
+         current-frame-id nil
+         tree-table (make-hash-table :test 'equal)
+         var-update-fn update-fn)))
     (with-current-buffer (car buf-created)
-      (when reset-flag
-        (let ((var-map (dapdbg-ui--var-tree-table var-tree)))
-          (dolist (id (dapdbg-ui--var-tree-root-ids var-tree))
-            (let ((var-obj (gethash id var-map)))
-              (puthash "value" "_" var-obj)
-              (puthash "type" "<invalid>" var-obj)
-              (puthash :child-ids nil var-obj)))))
-      (let ((reload-ids (dapdbg-ui--add-to-variables-tree parent-id thing-list var-tree)))
-        (if reload-ids
-            (dolist (reload reload-ids)
-              (let* ((parent-id (car reload))
-                     (var-ref (cdr reload))
-                     (handler (lambda (parsed-msg1)
-                                (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                                  (funcall processor parent-id vars)))))
-                (dapdbg--variables var-ref handler)))
-          (dapdbg-ui--refresh-variables-display)))) ; at a leaf node
+      (let ((var-tree (dapdbg-ui--get-tree-for-frame frame-id)))
+        (when reset-flag
+          (setq-local current-frame-id frame-id)
+          (let ((var-map (dapdbg-ui--var-tree-table var-tree)))
+            (dolist (id (dapdbg-ui--var-tree-root-ids var-tree))
+              (let ((var-obj (gethash id var-map)))
+                (puthash :valid nil var-obj)))))
+        (let ((reload-ids (dapdbg-ui--add-to-variables-tree parent-id child-list var-tree)))
+          (if reload-ids
+              (dapdbg-ui--reload-child-vars reload-ids)
+            (dapdbg-ui--refresh-variables-display))))) ; at a leaf node
     (display-buffer (car buf-created))))
 
 (defmacro dapdbg-ui--make-variables-update-fn (short-name docstring buf-name)
   (let ((fn-symbol (intern (format "dapdbg-ui--%s-update" short-name))))
-    `(defun ,fn-symbol (parent-id thing-list &optional reset-flag)
+    `(defun ,fn-symbol (frame-id parent-id child-list &optional reset-flag)
        ,docstring
-       (dapdbg-ui--variables-refresh parent-id thing-list
+       (dapdbg-ui--variables-refresh frame-id parent-id child-list
                                      ,buf-name '
                                      ,(intern (format "dapdbg-ui-%s-mode" short-name))
                                      ',fn-symbol
@@ -435,7 +467,7 @@ of the current buffer."
 
 ;; ------------------- callbacks ---------------------
 
-(defun dapdbg-ui--handle-scopes-response (parsed-msg)
+(defun dapdbg-ui--handle-scopes-response (stack-path parsed-msg)
   (let ((scopes (gethash "scopes" (gethash "body" parsed-msg))))
     (dolist (scope scopes)
       (let ((kind (or (gethash "name" scope) (gethash "presentationHint" scope)))
@@ -450,7 +482,7 @@ of the current buffer."
           (when processor
             (let ((handler (lambda (parsed-msg1)
                              (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                               (funcall processor kind vars t)))))
+                               (funcall processor stack-path kind vars t)))))
               (dapdbg--variables id handler))))))))
 
 (defun dapdbg-ui--handle-stacktrace-response (parsed-msg)
@@ -458,7 +490,9 @@ of the current buffer."
          (ip-ref (gethash "instructionPointerReference" (car stack)))
          (frame-id (gethash "id" (car stack)))
          (source (gethash "source" (car stack))))
-    (dapdbg--scopes frame-id #'dapdbg-ui--handle-scopes-response)
+    (let ((stack-path (string-join (nreverse (mapcar (lambda (frame) (gethash "name" frame)) stack)) "/")))
+      (message stack-path)
+      (dapdbg--scopes frame-id (apply-partially #'dapdbg-ui--handle-scopes-response stack-path)))
     (when source
       (let* ((filename (gethash "path" source))
              (linenumber (gethash "line" (car stack)))
