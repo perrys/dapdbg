@@ -120,7 +120,7 @@ information. It includes a keymap for basic debugger control."
 
 (defun dapdbg-ui--eval-repl (expr)
   (interactive "sExpression: ")
-  (dapdbg--eval-repl
+  (dapdbg--request-eval-repl
    expr
    (lambda (parsed-msg)
      (dapdbg-ui--output (format "> %s\n" expr) "repl-input")
@@ -370,7 +370,7 @@ of the current buffer."
     (if (> (length (gethash :child-ids parent)) 0)
         (dapdbg-ui--un-expand-variable parent)
       (if (> var-id 0)
-          (dapdbg--variables var-id handler)
+          (dapdbg--request-variables var-id handler)
         (warn "variable is not expandable")))))
 
 (defun dapdbg-ui--get-tree-for-frame (frame-id)
@@ -395,7 +395,7 @@ provided by the DAP server."
              (handler (lambda (parsed-msg1)
                         (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
                           (funcall update-fn frame-id parent-id vars)))))
-        (dapdbg--variables var-ref handler)))))
+        (dapdbg--request-variables var-ref handler)))))
 
 (defun dapdbg-ui--variables-refresh (frame-id parent-id child-list buf-name mode update-fn &optional reset-flag)
   "Update the tree structure for FRAME-ID with children of variable
@@ -483,7 +483,7 @@ PARENT-ID provided in CHILD-LIST."
             (let ((handler (lambda (parsed-msg1)
                              (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
                                (funcall processor stack-path kind vars t)))))
-              (dapdbg--variables id handler))))))))
+              (dapdbg--request-variables id handler))))))))
 
 (defun dapdbg-ui--handle-stacktrace-response (parsed-msg)
   (let* ((stack (gethash "stackFrames" (gethash "body" parsed-msg)))
@@ -491,8 +491,7 @@ PARENT-ID provided in CHILD-LIST."
          (frame-id (gethash "id" (car stack)))
          (source (gethash "source" (car stack))))
     (let ((stack-path (string-join (nreverse (mapcar (lambda (frame) (gethash "name" frame)) stack)) "/")))
-      (message stack-path)
-      (dapdbg--scopes frame-id (apply-partially #'dapdbg-ui--handle-scopes-response stack-path)))
+      (dapdbg--request-scopes frame-id (apply-partially #'dapdbg-ui--handle-scopes-response stack-path)))
     (when source
       (let* ((filename (gethash "path" source))
              (linenumber (gethash "line" (car stack)))
@@ -509,7 +508,7 @@ PARENT-ID provided in CHILD-LIST."
 (add-hook 'dapdbg--output-callback-list #'dapdbg-ui--handle-output-event)
 
 (defun dapdbg-ui--handle-stopped-event (_parsed-msg)
-  (dapdbg--stacktrace nil #'dapdbg-ui--handle-stacktrace-response))
+  (dapdbg--request-stacktrace nil #'dapdbg-ui--handle-stacktrace-response))
 
 (add-hook 'dapdbg--stopped-callback-list #'dapdbg-ui--handle-stopped-event)
 

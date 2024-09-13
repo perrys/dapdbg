@@ -51,12 +51,15 @@ The GDB debugger implements the DAP interface with the
 command-line flags '-i dap'. Note that GDB supports DAP from
 version 14 onwards.")
 
-(defvar dapdbg-launch-args nil 
+(defvar dapdbg-launch-args nil
   "Additional properties to pass to the launch command (debugger dependent).")
 
 ;; ------------------- initialization and session ---------------------
 
 (cl-defstruct dapdbg-session
+  "Represents the state of the current connection to the debugger,
+for keeping track of things like initialization state, request-response callbacks,
+breakpoints and latest thread/stack state when stopped."
   (process nil :read-only t)
   (callbacks (make-hash-table :test 'equal) :read-only t)
   (source-breakpoints (make-hash-table :test 'equal) :read-only t)
@@ -68,22 +71,25 @@ version 14 onwards.")
   (config-done nil)
   (capabilities nil))
 
-(defvar dapdbg--ssn nil
-  "The global session object (only one session is allowed)")
+(defvar dapdbg--ssn (make-dapdbg-session)
+  "The global session object (only one session is allowed).")
 
 (defconst dapdbg--lldb-plist
   (list :type "lldb-dap"
         :command-line-sym 'dapdbg-lldb-command-line
         :prompt "(lldb)"
-        :stop-on-entry-sym :stopOnEntry))
+        :stop-on-entry-sym :stopOnEntry)
+  "Configuration specific to the LLDB debugger.")
 
 (defconst dapdbg--gdb-plist
   (list :type "gdb-dap"
         :command-line-sym 'dapdbg-gdb-command-line
         :prompt "(gdb)"
-        :stop-on-entry-sym :stopAtBeginningOfMainSubprogram))
+        :stop-on-entry-sym :stopAtBeginningOfMainSubprogram)
+  "Configuration specific to the GDB debugger.")
 
 (defun dapdbg--connect (command-line)
+  "Start up the debugger in a sub-process, ready for communication."
   (let ((proc (make-process
                :name "dapdbg-session"
                :connection-type 'pipe
@@ -91,10 +97,20 @@ version 14 onwards.")
                :command command-line
                :stderr "*debugger stderr*"
                :filter #'dapdbg--handle-server-message
-               :noquery t)))
-    (setq dapdbg--ssn (make-dapdbg-session :process proc))))
+               :noquery t))
+        (prev-ssn dapdbg--ssn))
+    (setq dapdbg--ssn (make-dapdbg-session :process proc))
+    (when prev-ssn
+      (let ((old-bps (dapdbg-session-source-breakpoints prev-ssn))
+            (new-bps (dapdbg-session-source-breakpoints dapdbg--ssn)))
+        (maphash (lambda (k v) (puthash k v new-bps))
+                 old-bps)))
+    ))
 
-(defun dapdbg--launch-initialize (program program-arguments debugger-plist)
+(defun dapdbg--request-initialize (program program-arguments debugger-plist)
+  "Send an initialize request - this is stage 1 of the
+initialization process. See
+https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
   (let ((arguments (list
                     :name (file-name-nondirectory program)
                     :type (plist-get debugger-plist :type)
@@ -102,7 +118,7 @@ version 14 onwards.")
                     :program (expand-file-name program)
                     (plist-get debugger-plist :stop-on-entry-sym) t)))
     (when program-arguments
-      (plist-put arguments :args program-arguments)) 
+      (plist-put arguments :args program-arguments))
     (setf (dapdbg-session-launch-args dapdbg--ssn) arguments))
   (let ((args (list
                :clientID "dapdbg"
@@ -115,9 +131,10 @@ version 14 onwards.")
                :supportsVariablePaging t
                :supportsRunInTerminalRequest t
                :locale "en-us")))
-    (dapdbg--send-request "initialize" args #'dapdbg--handle-initialize-response t)))
+    (dapdbg--send-request "initialize" args #'dapdbg--handle-initialize-response)))
 
-(defun dapdbg--start (command-line debugger-plist)
+(defun dapdbg--connect-and-initialize (command-line debugger-plist)
+  "Common start method for all debugger types."
   (let ((toks (string-split command-line nil t)))
     (unless (> (length toks) 0)
       (error "empty command-line"))
@@ -127,29 +144,53 @@ version 14 onwards.")
         (_ (error "Aborted"))))
     (dapdbg--connect (eval (plist-get debugger-plist :command-line-sym)))
     (setf (dapdbg-session-prompt dapdbg--ssn) (plist-get debugger-plist :prompt))
-    (dapdbg--launch-initialize (car toks) (cdr toks) debugger-plist)))
+    (dapdbg--request-initialize (car toks) (cdr toks) debugger-plist)))
+
+(defun dapdbg--start-lldb (command-line)
+  "Start up the LLDB debugger."
+  (dapdbg--connect-and-initialize command-line dapdbg--lldb-plist))
+
+(defun dapdbg--start-gdb (command-line)
+  "Start up the GDB debugger."
+  (dapdbg--connect-and-initialize command-line dapdbg--gdb-plist))
 
 (defun dapdbg--ready-p ()
   (and dapdbg--ssn
        (process-live-p (dapdbg-session-process dapdbg--ssn))
        (dapdbg-session-config-done dapdbg--ssn)))
 
-(defun dapdbg--start-lldb (command-line)
-  (dapdbg--start command-line dapdbg--lldb-plist))
-
-(defun dapdbg--start-gdb (command-line)
-  (dapdbg--start command-line dapdbg--gdb-plist))
-
 (defun dapdbg--handle-initialize-response (msg)
   (let ((caps (gethash "body" msg)))
-    (dolist (cap '("supportsConditionalBreakpoints" "supportsConfigurationDoneRequest" "supportsDisassembleRequest"))
+    (dolist (cap '("supportsConditionalBreakpoints" "supportsConfigurationDoneRequest"))
       (unless (gethash cap caps)
         (dapdbg-disconnect)
         (error "Debugger does not have capability \"%s\"" cap)))
-    (setf (dapdbg-session-capabilities dapdbg--ssn) caps))
+    ;; now wait for initialized event
+    (setf (dapdbg-session-capabilities dapdbg--ssn) caps)))
+
+(defun dapdbg--request-launch ()
   (let ((args (dapdbg-session-launch-args dapdbg--ssn)))
-                                        ;(dapdbg--set-all-breakpoints)
-    (dapdbg--send-request "launch" args nil t)))
+    (dapdbg--send-request "launch" args nil)))
+
+(defun dapdbg--handle-response-configdone (msg)
+  (setf (dapdbg-session-config-done dapdbg--ssn) t)
+  (dapdbg--request-launch))
+
+(defun dapdbg--request-configuration-done ()
+  "At then end of the initialization sequence, send \"configurationDone\" and do launch afterwards."
+  (dapdbg--send-request "configurationDone" nil #'dapdbg--handle-response-configdone))
+
+(defun dapdbg--handle-event-initialized (_parsed-msg)
+  "Once the intialized event is recieved - set any breakpoints, then
+proceed with the initialization sequence."
+  (dapdbg--set-all-breakpoints #'dapdbg--request-configuration-done))
+
+(defun dapdbg--initialized-p ()
+  "Check that the debugger is alive and has initialized. See
+https://microsoft.github.io/debug-adapter-protocol/specification#Requests_Initialize."
+  (and dapdbg--ssn
+       (process-live-p (dapdbg-session-process dapdbg--ssn))
+       (dapdbg-session-capabilities dapdbg--ssn)))
 
 (defun dapdbg-quit ()
   "Shut down and disconnect from the currently running DAP server (if any)."
@@ -159,13 +200,11 @@ version 14 onwards.")
         (if (process-live-p proc)
             (kill-process proc)))))
 
-(defun dapdbg--handle-response-configdone (msg)
-  (setf (dapdbg-session-config-done dapdbg--ssn) t))
-
 ;; ------------------- commands ---------------------
 
 (defmacro dapdbg--make-thread-command (name command docstring &optional args)
   `(defun ,(intern (format "dapdbg-%s" name)) ()
+     ,docstring
      (interactive)
      (let ((pargs (list :threadId (dapdbg-session-thread-id dapdbg--ssn))))
        ,(when args `(nconc pargs ,args))
@@ -181,6 +220,8 @@ version 14 onwards.")
 ;; ------------------- breakpoint logic ---------------------
 
 (defun dapdbg--get-or-create-source-table (filename)
+  "Get the breakpoint hashtable for the given filename, which is
+keyed by line number. Create one if it does not already exist."
   (let* ((bp-table (dapdbg-session-source-breakpoints dapdbg--ssn))
          (source-table (gethash filename bp-table)))
     (unless source-table
@@ -189,6 +230,12 @@ version 14 onwards.")
     source-table))
 
 (defun dapdbg-toggle-breakpoint (&optional filename linenumber)
+  "Toggle the breakpoint request for the given filename and line
+number. If the debugger is running, this will create a request to
+update the breakpoints for that source file.
+
+When called interactively, take the location from point in the
+current buffer."
   (interactive)
   (unless filename
     (setq filename (expand-file-name (buffer-file-name))))
@@ -199,11 +246,39 @@ version 14 onwards.")
       (if existing-bp
           (remhash linenumber source-table)
         (puthash linenumber linenumber source-table)))
+    (if (dapdbg--ready-p)
+        (dapdbg--request-set-breakpoints-for-file filename)
+      (let ((source-table (dapdbg--get-or-create-source-table filename))
+            (updated-table (make-hash-table :test 'equal)))
+        (puthash filename source-table updated-table)
+        (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table)))))
+
+(defun dapdbg--request-set-breakpoints-for-file (filename &optional callback)
+  "Request the debugger to update the breakpoints for the source FILENAME."
+  (let ((source-table (dapdbg--get-or-create-source-table filename)))
     (dapdbg--send-request
      "setBreakpoints"
      (list :source (list :name (file-name-nondirectory filename) :path filename)
            :breakpoints (vconcat (mapcar (lambda (n) (list :line n)) (hash-table-keys source-table))))
-     (apply-partially #'dapdbg--update-breakpoint-table filename))))
+     (lambda (parsed-msg)
+       (dapdbg--update-breakpoint-table filename parsed-msg)
+       (if callback
+           (funcall callback parsed-msg))))))
+
+(defun dapdbg--set-breakpoint-in-chain (remaining-filenames final-callback _parsed-msg)
+  (if remaining-filenames
+      (dapdbg--request-set-breakpoints-for-file
+       (car remaining-filenames)
+       (apply-partially #'dapdbg--set-breakpoint-in-chain (cdr remaining-filenames) final-callback))
+    (when final-callback ; no filenames remaining
+      (funcall final-callback))))
+
+(defun dapdbg--set-all-breakpoints (&optional final-callback)
+  "Chain a set of requests to set source breakpoints for all
+filenames, then call any final callback."
+  (let* ((bp-table (dapdbg-session-source-breakpoints dapdbg--ssn))
+         (filenames (hash-table-keys bp-table)))
+    (dapdbg--set-breakpoint-in-chain filenames final-callback nil)))
 
 (defun dapdbg--update-breakpoint-table (filename bp-response)
   (unless (equal "setBreakpoints" (gethash "command" bp-response))
@@ -212,8 +287,8 @@ version 14 onwards.")
         (updated-table (make-hash-table :test 'equal)))
     (puthash filename source-table updated-table)
     (dolist (bp-details (gethash "breakpoints" (gethash "body" bp-response)))
-      (let ((linenumber (gethash "line" bp-details)))
-        (puthash linenumber bp-details source-table)))
+      (when (gethash "verified" bp-details)
+        (puthash (gethash "line" bp-details) bp-details source-table)))
     (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table)))
 
 (defun dapdbg--update-breakpoint-table-single-bp (bp-details &optional remove)
@@ -229,22 +304,22 @@ version 14 onwards.")
 
 ;; ------------------- internal requests ---------------------
 
-(defun dapdbg--stacktrace (&optional thread-id callback)
+(defun dapdbg--request-stacktrace (&optional thread-id callback)
   (let ((tid thread-id))
     (unless tid
       (setq tid (dapdbg-session-thread-id dapdbg--ssn)))
     (dapdbg--send-request "stackTrace" (list :threadId tid) callback)))
 
-(defun dapdbg--scopes (frame-id callback)
+(defun dapdbg--request-scopes (frame-id callback)
   (dapdbg--send-request "scopes" (list :frameId frame-id) callback))
 
-(defun dapdbg--variables (ref-id callback)
+(defun dapdbg--request-variables (ref-id callback)
   (dapdbg--send-request "variables" (list :variablesReference ref-id) callback))
 
-(defun dapdbg--memory-dump (start-address count &optional callback)
+(defun dapdbg--request-memory-dump (start-address count &optional callback)
   (dapdbg--send-request "readMemory" (list :memoryReference start-address :count count) callback))
 
-(defun dapdbg--eval-repl (expr &optional callback)
+(defun dapdbg--request-eval-repl (expr &optional callback)
   (dapdbg--send-request "evaluate" (list :expression expr :context "repl") callback))
 
 ;; ------------------- event handlers ---------------------
@@ -316,9 +391,7 @@ by the DAP protocol
 (defun dapdbg--register-callback (seq callback)
   (puthash seq callback (dapdbg-session-callbacks dapdbg--ssn)))
 
-(defun dapdbg--send-request (command &optional args callback skip-ready-check)
-  (unless (or skip-ready-check (dapdbg--ready-p))
-    (error "Debugger is not initialized"))
+(defun dapdbg--send-request (command &optional args callback)
   (pcase-let ((`(:header ,hdrs :body ,body :seq ,seq) (dapdbg--create-request command args)))
     (dapdbg--io-message hdrs body t)
     (if callback
@@ -328,7 +401,7 @@ by the DAP protocol
 (defun dapdbg--handle-event (parsed-msg)
   (pcase (gethash "event" parsed-msg)
     ("initialized"
-     (dapdbg--send-request "configurationDone" nil #'dapdbg--handle-response-configdone t))
+     (dapdbg--handle-event-initialized parsed-msg))
     ("stopped"
      (dapdbg--handle-event-stopped parsed-msg)
      (run-hook-with-args 'dapdbg--stopped-callback-list parsed-msg))
@@ -433,12 +506,12 @@ onto the start of the next message."
 
 (defun dapdbg--io-buf ()
   "Buffer to display request/response messages if dapdbg-print-io is t"
-  (let ((buf-created (dapdbg--get-or-create-buffer "*dapdbg IO*"))) 
+  (let ((buf-created (dapdbg--get-or-create-buffer "*dapdbg IO*")))
     (when (cdr buf-created)
       (with-current-buffer (car buf-created)
         (js-json-mode)
         (font-lock-mode -1)))
-    (car buf-created))) 
+    (car buf-created)))
 
 (defun dapdbg--io-message (hdrs msg is-request)
   (when dapdbg-io-print-flag
@@ -461,7 +534,7 @@ onto the start of the next message."
       (goto-char (point-max))
       )))
 
-(defun dapdbg--disassembly-request (callback mem-ref &optional instructions-preceeding instruction-count)
+(defun dapdbg--request-disassembly (callback mem-ref &optional instructions-preceeding instruction-count)
   "Get disassembly for the given session, for the optional
    address range (defaults to 64 instructions either side of the
    instruction pointer)."
@@ -494,5 +567,3 @@ onto the start of the next message."
 (provide 'dapdbg)
 
 ;;; dabdbg.el ends here
-
-
