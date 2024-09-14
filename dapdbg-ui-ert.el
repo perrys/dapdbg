@@ -54,7 +54,7 @@
 
 (ert-deftest can-serialize-tree ()
   (let ((mytree (dapdbg-ui-test-create-tree)))
-    (let ((result (dapdbg-ui--make-variables-list mytree)))
+    (let ((result (dapdbg-ui--make-variables-tabulated-list mytree)))
       (should result)
       (should (eq 3 (length result)))
       (should (equal "Locals/args" (car (nth 0 result))))
@@ -68,6 +68,3 @@
                    "Locals" (list (copy-hash-table (gethash "Locals/args" mytable))) mytree)))
     (should (eq 1 (length updates)))
     (should (equal (cons "Locals/args"  3) (car updates)))))
-
-    
-

@@ -298,6 +298,13 @@ reloading."
             (push id (dapdbg-ui--var-tree-root-ids var-tree))))))
     reload-ids))
 
+(defun dapdbg-ui--startswith (needle haystack)
+  (equal needle
+         (downcase (substring haystack 0 (length needle)))))
+
+(defun dapdbg-ui--escape (str)
+  (mapconcat (lambda (c) (if (eql c ?\n) "\\n" (list c))) str))
+
 (defun dapdbg-ui--make-variables-tabulated-list-r (id var-table depth target-list)
   "Construct a list for display by recursing through the tree
 structure starting from the node in VAR-TABLE with key ID,
@@ -305,13 +312,17 @@ pushing each item to TARGET-LIST."
   (let* ((node (gethash id var-table))
          (my-children (gethash :child-ids node))
          (valid (gethash :valid node))
+         (type-val (gethash "type" node))
+         (display-type (if (and (eql depth 0) (dapdbg-ui--startswith "global" id))
+                           (format "<glbl> %s" type-val)
+                         type-val))
          (switch (cond ((not (seq-empty-p my-children)) "- ")
                        ((> (gethash "variablesReference" node) 0) "+ ")
                        (t "  ")))
          (pad-fmt (format "%%%ds%%s%%s" (* 2 depth)))
          (name (format pad-fmt "" switch (gethash "name" node)))
-         (type (format "%s" (if valid (gethash "type" node) "<invalid>")))
-         (value (format "%s" (if valid (gethash "value" node) "_")))
+         (type (format "%s" (if valid display-type "<invalid>")))
+         (value (format "%s" (if valid (dapdbg-ui--escape (gethash "value" node)) "_")))
          (entry (list id (vector
                           (propertize name 'face 'font-lock-variable-name-face)
                           (propertize type 'face 'font-lock-type-face)
@@ -356,7 +367,7 @@ of the current buffer."
          (var-id (gethash "variablesReference" parent))
          (handler (lambda (parsed-msg1)
                     (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                      (funcall var-update-fn current-call-stack-id parent-id vars)))))
+                      (dapdbg-ui--variables-refresh current-call-stack-id parent-id vars (buffer-name))))))
     (if (> (length (gethash :child-ids parent)) 0)
         (dapdbg-ui--un-expand-variable parent)
       (if (> var-id 0)
@@ -375,16 +386,16 @@ the local hash table for the current buffer."
   "Request variable data for the variables specified in RELOAD-IDS,
 each of which is a cons-pair of parent-path and the reference id
 provided by the DAP server."
-  (unless (and var-update-fn current-call-stack-id)
+  (unless current-call-stack-id
     (error "not in a variables buffer"))
   (let ((call-stack-id current-call-stack-id)
-        (update-fn var-update-fn))
+        (buf-name (buffer-name)))
     (dolist (reload reload-ids)
       (let* ((parent-id (car reload))
              (var-ref (cdr reload))
-             (handler (lambda (parsed-msg1)
-                        (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                          (funcall update-fn call-stack-id parent-id vars)))))
+             (handler (lambda (parsed-msg)
+                        (let ((vars (gethash "variables" (gethash "body" parsed-msg))))
+                          (dapdbg-ui--variables-refresh call-stack-id parent-id vars buf-name)))))
         (dapdbg--request-variables var-ref handler)))))
 
 (defun dapdbg-ui--get-variables-buffer (buf-name)
@@ -399,12 +410,11 @@ provided by the DAP server."
          tree-table (make-hash-table :test 'equal))))
     (car buf-created)))
 
-(defun dapdbg-ui--variables-refresh (call-stack-id parent-id child-list buf-name update-fn)
+(defun dapdbg-ui--variables-refresh (call-stack-id parent-id child-list buf-name)
   "Update the tree structure for CALL-STACK-ID with children of variable
 PARENT-ID provided in CHILD-LIST."
   (let ((buf (dapdbg-ui--get-variables-buffer buf-name)))
     (with-current-buffer buf
-      (setq-local var-update-fn update-fn)
       (let* ((var-tree (dapdbg-ui--get-tree-for-call-stack call-stack-id))
              (reload-ids (dapdbg-ui--add-to-variables-tree parent-id child-list var-tree)))
         (if reload-ids
@@ -417,8 +427,7 @@ PARENT-ID provided in CHILD-LIST."
     `(defun ,fn-symbol (call-stack-id parent-id child-list)
        ,docstring
        (dapdbg-ui--variables-refresh call-stack-id parent-id child-list
-                                     ,buf-name
-                                     ',fn-symbol))))
+                                     ,buf-name))))
 
 (defconst dapdbg-ui--variables-buffer-name "*Variables*")
 (defconst dapdbg-ui--registers-buffer-name "*Registers*")

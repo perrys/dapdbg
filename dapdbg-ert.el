@@ -17,7 +17,7 @@ Accept: application/json
         '(setq dapdbg--ssn (make-dapdbg-session))
         form
         '(setq dapdbg--ssn nil)))
-        
+
 (ert-deftest can-parse-compound-msg ()
   (with-test-setup
    (let ((msg "Content-Length: 77
@@ -27,7 +27,7 @@ Accept: application/json
 {\"body\":{\"isLocalProcess\":true,\"name\":\"/home/stu/dev/advent_of_code/2022/rust/target/debug/day10\",\"startMethod\":\"launch\",\"systemProcessId\":34279},\"event\":\"process\",\"seq\":0,\"type\":\"event\"}Content-Length: 47
 
 {\"event\":\"xinitialized\",\"seq\":0,\"type\":\"event\"}"))
-     (should (equal '(99 210 69) (dapdbg--handle-message nil msg))))))
+     (should (equal '(99 210 69) (dapdbg--handle-server-message nil msg))))))
 
 (ert-deftest can-route-callback ()
   (with-test-setup
@@ -38,6 +38,6 @@ Accept: application/json
        (dapdbg--register-callback
         seq-number (lambda (msg)
                      (setq cb-value (gethash "foo" msg))))
-       (dapdbg--handle-message nil (format "%s\r\n%s" hdrs body))
+       (dapdbg--handle-server-message nil (format "%s\r\n%s" hdrs body))
        (should (string= "bar" cb-value))
        ))))
