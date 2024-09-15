@@ -67,7 +67,7 @@ information. It includes a keymap for basic debugger control."
 (defvar-keymap dapdbg-ui-call-stack-mode-map
   :doc "Local keymap for `STrace' buffers."
   :parent tabulated-list-mode-map
-  "RET" #'dapdbg-ui--switch-stackframe)
+  "RET" #'dapdbg-ui--select-stack-frame)
 
 (define-derived-mode dapdbg-ui-call-stack-mode tabulated-list-mode "stack"
   "Major mode for stack trace display"
@@ -267,13 +267,24 @@ accounting for existing breakpoint markers."
 
 (defconst dapdbg-ui--call-stack-buffer-name "*Stack Frames*")
 
-(defun dapdbg-ui--call-stack-refresh (stacktrace)
+(defun dapdbg-ui--get-call-stack-buffer ()
   (let ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--call-stack-buffer-name)))
     (when (cdr buf-created)
       (with-current-buffer (car buf-created)
         (dapdbg-ui-call-stack-mode)
-        (font-lock-mode -1)))
-    (with-current-buffer (car buf-created)
+        (setq-local buffer-read-only t)
+        (font-lock-mode -1)
+        (make-variable-buffer-local 'current-thread-id)
+        (make-variable-buffer-local 'current-call-stack)
+        (setq-local marker-overlay (make-overlay 0 0))
+        (overlay-put marker-overlay :kind 'frame-marker)
+        (overlay-put marker-overlay 'face 'dapdbg-ui-marker-face)))
+    (car buf-created)))
+
+(defun dapdbg-ui--call-stack-display-update (call-stack)
+  "Update the table display in the call-stack buffer."
+  (let ((buf (dapdbg-ui--get-call-stack-buffer)))
+    (with-current-buffer buf
       (setq tabulated-list-entries
             (mapcar
              (lambda (frame)
@@ -283,9 +294,56 @@ accounting for existing breakpoint markers."
                  (list id (vector
                            (propertize iptr 'face 'font-lock-number-face)
                            (propertize name 'face 'font-lock-function-name-face)))))
-             stacktrace))
-      (tabulated-list-print))
-    (display-buffer (car buf-created))))
+             call-stack))
+      (tabulated-list-print)
+      (goto-char (point-min))
+      (display-buffer buf))))
+
+(defun dapdbg-ui--set-call-stack (thread-id call-stack)
+  "Set the current thread-id and call-stack, usually after a `stopped'
+event. This causes a chain of updates to occur in various panels."
+  (with-current-buffer (dapdbg-ui--get-call-stack-buffer)
+    (setq-local
+     current-thread-id thread-id
+     current-call-stack call-stack))
+  (dapdbg-ui--call-stack-display-update call-stack)
+  (dapdbg-ui--set-call-stack-context call-stack))
+
+(defun dapdbg-ui--select-stack-frame ()
+  "Select the frame at point in the call-stack buffer."
+  (interactive)
+  (with-current-buffer (dapdbg-ui--get-call-stack-buffer)
+    (let ((frame-id (tabulated-list-get-id))
+          (call-stack current-call-stack))
+      (while (and call-stack (/= frame-id (gethash "id" (car call-stack))))
+        (setq call-stack (cdr call-stack)))
+      (unless call-stack
+        (error "unable to find frame-id %d in current stack" frame-id))
+      (dapdbg-ui--set-call-stack-context call-stack)
+      (move-overlay marker-overlay (line-beginning-position) (line-end-position)))))
+
+(defun dapdbg-ui--set-call-stack-context (call-stack)
+  "Adjust various panels to show the context of the given call
+stack, which may be a partially-unwound portion of the stack that
+the debugee is current stopped at."
+  ;; create a "stack path" from the current call-stack to serve as an ID for caching variables etc:
+  (let ((call-stack-id (string-join (nreverse (mapcar (lambda (f) (gethash "name" f)) call-stack)) "/"))
+        (frame (car call-stack)))
+    (dapdbg-ui--invalidate-variables-buffers call-stack-id)
+    (dapdbg--request-scopes (gethash "id" frame)
+                            (apply-partially #'dapdbg-ui--handle-scopes-response call-stack-id))
+    (when (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
+      (let ((prog-counter (dapdbg--parse-address (gethash "instructionPointerReference" frame))))
+        (dapdbg--request-disassembly prog-counter nil (apply-partially #'dapdbg-ui--handle-disassembly prog-counter))))
+    (when-let ((source (gethash "source" frame)))
+      (let ((filename (gethash "path" source))
+            (linenumber (gethash "line" frame)))
+        (when (file-exists-p filename)
+          (with-current-buffer (find-file-noselect filename)
+            (dapdbg-ui-mode t)
+            (dapdbg-ui-mode--set-source-line-marker (current-buffer) linenumber))))
+      ;; TODO - remove marker if it was not set
+      )))
 
 ;; ------------------- variables & registers ---------------------
 
@@ -486,6 +544,21 @@ PARENT-ID provided in CHILD-LIST."
     (let ((buf (dapdbg-ui--get-variables-buffer (symbol-value buf-name))))
       (dapdbg-ui--invalidate-variables-buffer buf call-stack-id))))
 
+(defun dapdbg-ui--handle-scopes-response (call-stack-id parsed-msg)
+  (let ((scopes (gethash "scopes" (gethash "body" parsed-msg))))
+    (dolist (scope scopes)
+      (let ((kind (or (gethash "name" scope) (gethash "presentationHint" scope)))
+            (id (gethash "variablesReference" scope)))
+        (let ((processor
+               (pcase (downcase kind)
+                 ("registers" #'dapdbg-ui--registers-update)
+                 (_ #'dapdbg-ui--variables-update))))
+          (when processor
+            (let ((handler (lambda (parsed-msg1)
+                             (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
+                               (funcall processor call-stack-id kind vars)))))
+              (dapdbg--request-variables id handler))))))))
+
 ;; ------------------- disassembly ---------------------
 
 (defconst dapdbg-ui--disassembly-buffer-name "*Disassembly*")
@@ -516,9 +589,10 @@ PARENT-ID provided in CHILD-LIST."
             (when (eql (dapdbg--parse-address address) program-counter)
               (setq marker-point (point)))
             (insert (propertize line 'read-only t)))))
-      (font-lock-fontify-buffer))
-    (when (integer-or-marker-p marker-point)
-      (dapdbg-ui-mode--set-instruction-marker buf))
+      (font-lock-fontify-buffer)
+      (when (integer-or-marker-p marker-point)
+        (goto-char marker-point)
+        (dapdbg-ui-mode--set-instruction-marker buf)))
     (display-buffer buf)))
 
 (defun dapdbg-ui--handle-disassembly (ip-ref parsed-msg)
@@ -543,41 +617,12 @@ PARENT-ID provided in CHILD-LIST."
 
 ;; ------------------- callbacks ---------------------
 
-(defun dapdbg-ui--handle-scopes-response (call-stack-id parsed-msg)
-  (let ((scopes (gethash "scopes" (gethash "body" parsed-msg))))
-    (dolist (scope scopes)
-      (let ((kind (or (gethash "name" scope) (gethash "presentationHint" scope)))
-            (id (gethash "variablesReference" scope)))
-        (let ((processor
-               (pcase (downcase kind)
-                 ("registers" #'dapdbg-ui--registers-update)
-                 (_ #'dapdbg-ui--variables-update))))
-          (when processor
-            (let ((handler (lambda (parsed-msg1)
-                             (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                               (funcall processor call-stack-id kind vars)))))
-              (dapdbg--request-variables id handler))))))))
+(defun dapdbg-ui--handle-stacktrace-response (thread-id parsed-msg)
+  (let ((stack (gethash "stackFrames" (gethash "body" parsed-msg))))
+    (dapdbg-ui--set-call-stack thread-id stack)))
 
-(defun dapdbg-ui--handle-stacktrace-response (parsed-msg)
-  (let* ((stack (gethash "stackFrames" (gethash "body" parsed-msg)))
-         (ip-ref (gethash "instructionPointerReference" (car stack)))
-         (prog-counter (dapdbg--parse-address ip-ref))
-         (top-frame-id (gethash "id" (car stack)))
-         (source (gethash "source" (car stack))))
-    ;; create a "stack path" from the current call-stack to serve as an ID for caching variables etc:
-    (let ((call-stack-id (string-join (nreverse (mapcar (lambda (frame) (gethash "name" frame)) stack)) "/")))
-      (dapdbg-ui--invalidate-variables-buffers call-stack-id)
-      (dapdbg--request-scopes top-frame-id (apply-partially #'dapdbg-ui--handle-scopes-response call-stack-id)))
-    (when (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
-      (dapdbg--request-disassembly prog-counter nil nil (apply-partially #'dapdbg-ui--handle-disassembly prog-counter)))
-    (when source
-      (let* ((filename (gethash "path" source))
-             (linenumber (gethash "line" (car stack)))
-             (buf (find-file-noselect filename)))
-        (with-current-buffer buf
-          (dapdbg-ui-mode t))
-        (dapdbg-ui-mode--set-source-line-marker buf linenumber)))
-    (dapdbg-ui--call-stack-refresh stack)))
+(defun dapdbg-ui--handle-threads-response (parsed-msg)
+  nil) ;; TODO
 
 (defun dapdbg-ui--handle-output-event (parsed-msg)
   (let ((body (gethash "body" parsed-msg)))
@@ -586,7 +631,9 @@ PARENT-ID provided in CHILD-LIST."
 (add-hook 'dapdbg--output-callback-list #'dapdbg-ui--handle-output-event)
 
 (defun dapdbg-ui--handle-stopped-event (_parsed-msg)
-  (dapdbg--request-stacktrace nil #'dapdbg-ui--handle-stacktrace-response))
+  ;; current thread ID has already been set on the session object
+  (dapdbg--request-stacktrace nil #'dapdbg-ui--handle-stacktrace-response)
+  (dapdbg--request-threads #'dapdbg-ui--handle-threads-response))
 
 (add-hook 'dapdbg--stopped-callback-list #'dapdbg-ui--handle-stopped-event)
 
