@@ -73,7 +73,8 @@ information. It includes a keymap for basic debugger control."
   "Major mode for stack trace display"
   :interactive nil
   (setq tabulated-list-format
-        (vector '("Prog Counter" 12 nil :right-align t)
+        (vector '("Idx" 3 nil :right-align t)
+                '("Prog Counter" 12 nil :right-align t)
                 '("Function" 999 nil)))
   (tabulated-list-init-header))
 
@@ -283,15 +284,18 @@ accounting for existing breakpoint markers."
 
 (defun dapdbg-ui--call-stack-display-update (call-stack)
   "Update the table display in the call-stack buffer."
-  (let ((buf (dapdbg-ui--get-call-stack-buffer)))
+  (let ((buf (dapdbg-ui--get-call-stack-buffer))
+        (idx -1))
     (with-current-buffer buf
       (setq tabulated-list-entries
             (mapcar
              (lambda (frame)
+               (cl-incf idx)
                (let ((id (gethash "id" frame))
                      (iptr (substring (gethash "instructionPointerReference" frame) 2))
                      (name (gethash "name" frame)))
                  (list id (vector
+                           (propertize (format "%d" idx) 'face 'font-lock-variable-name-face)
                            (propertize iptr 'face 'font-lock-number-face)
                            (propertize name 'face 'font-lock-function-name-face)))))
              call-stack))
@@ -332,9 +336,7 @@ the debugee is current stopped at."
     (dapdbg-ui--invalidate-variables-buffers call-stack-id)
     (dapdbg--request-scopes (gethash "id" frame)
                             (apply-partially #'dapdbg-ui--handle-scopes-response call-stack-id))
-    (when (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
-      (let ((prog-counter (dapdbg--parse-address (gethash "instructionPointerReference" frame))))
-        (dapdbg--request-disassembly prog-counter nil (apply-partially #'dapdbg-ui--handle-disassembly prog-counter))))
+    (dapdbg-ui--handle-program-counter-updated (dapdbg--parse-address (gethash "instructionPointerReference" frame)))
     (when-let ((source (gethash "source" frame)))
       (let ((filename (gethash "path" source))
             (linenumber (gethash "line" frame)))
@@ -572,25 +574,25 @@ PARENT-ID provided in CHILD-LIST."
         (font-lock-mode -1)
         ;; do this after setting the major mode
         (setq-local
-         last-range (cons 0 0))))
+         address-bol-map (make-hash-table :test 'eql))))
     (car buf-created)))
 
 (defun dapdbg-ui--disassembly-render (program-counter instructions)
-  (let ((marker-point nil)
-        (buf (dapdbg-ui--get-disassembly-buffer)))
+  (let ((buf (dapdbg-ui--get-disassembly-buffer)))
     (with-current-buffer buf
+      (clrhash address-bol-map)
       (let ((inhibit-read-only t))
         (erase-buffer)
         (dolist (instruction instructions)
-          (let* ((address (gethash "address" instruction))
+          (let* ((address-str (gethash "address" instruction))
+                 (pc (dapdbg--parse-address address-str))
                  (line (format "%s: %s\n"
-                               address
+                               address-str
                                (gethash "instruction" instruction))))
-            (when (eql (dapdbg--parse-address address) program-counter)
-              (setq marker-point (point)))
+            (puthash pc (point) address-bol-map)
             (insert (propertize line 'read-only t)))))
       (font-lock-fontify-buffer)
-      (when (integer-or-marker-p marker-point)
+      (when-let ((marker-point (gethash program-counter address-bol-map)))
         (goto-char marker-point)
         (dapdbg-ui-mode--set-instruction-marker buf)))
     (display-buffer buf)))
@@ -598,6 +600,15 @@ PARENT-ID provided in CHILD-LIST."
 (defun dapdbg-ui--handle-disassembly (ip-ref parsed-msg)
   (let ((instructions (gethash "instructions" (gethash "body" parsed-msg))))
     (dapdbg-ui--disassembly-render ip-ref instructions)))
+
+(defun dapdbg-ui--handle-program-counter-updated (program-counter)
+  (when (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
+    (with-current-buffer (dapdbg-ui--get-disassembly-buffer)
+      (if-let ((marker-point (gethash program-counter address-bol-map)))
+          (progn
+            (goto-char marker-point)
+            (dapdbg-ui-mode--set-instruction-marker (current-buffer)))
+        (dapdbg--request-disassembly program-counter nil (apply-partially #'dapdbg-ui--handle-disassembly program-counter))))))
 
 ;; ------------------- breakpoints ---------------------
 
