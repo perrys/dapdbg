@@ -228,18 +228,21 @@ https://microsoft.github.io/debug-adapter-protocol/specification#Requests_Initia
 
 ;; ------------------- commands ---------------------
 
-(defmacro dapdbg--make-thread-command (name command docstring &optional args)
+(defmacro dapdbg--make-thread-command (name command docstring &optional args capability)
   `(defun ,(intern (format "dapdbg-%s" name)) ()
      ,docstring
      (interactive)
+     ,(if capability
+          `(unless (gethash ,capability (dapdbg-session-capabilities dapdbg--ssn))
+             (error "Debugger does not have capability: \"%s\"" ,capability)))
      (let ((pargs (list :threadId (dapdbg-session-thread-id dapdbg--ssn))))
        ,(when args `(nconc pargs ,args))
        (dapdbg--send-request ,command pargs))))
 
 (dapdbg--make-thread-command "next" "next" "Step one line (skip functions).")
-(dapdbg--make-thread-command "nexti" "next" "Step one instruction (skip functions)." '(:granularity "instruction"))
+(dapdbg--make-thread-command "nexti" "next" "Step one instruction (skip functions)." '(:granularity "instruction") "supportsSteppingGranularity")
 (dapdbg--make-thread-command "step" "stepIn" "Step one source line.")
-(dapdbg--make-thread-command "stepi" "stepIn" "Step one instruction." '(:granularity "instruction"))
+(dapdbg--make-thread-command "stepi" "stepIn" "Step one instruction." '(:granularity "instruction") "supportsSteppingGranularity")
 (dapdbg--make-thread-command "finish" "stepOut" "Finish executing the current function.")
 (dapdbg--make-thread-command "continue" "continue" "Resume exceution.")
 
@@ -327,6 +330,26 @@ filenames, then call any final callback."
         (remhash linenumber  source-table)
       (puthash linenumber bp-details source-table))
     (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table)))
+
+;; ------------------- disassembly ---------------------
+
+(defun dapdbg--request-disassembly (program-counter &optional instructions-preceeding instruction-count callback)
+  "Get disassembly for the given session, for the optional address
+range (defaults to 64 instructions either side of the instruction
+pointer)."
+  (unless (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
+    (error "disassemble request is not supported by the current debugger"))
+  (let ((disassemble-args (list :memoryReference (format "0x%x" program-counter)
+                                :instructionOffset (or instructions-preceeding -63)
+                                :instructionCount (or instruction-count 128))))
+    (dapdbg--send-request "disassemble" disassemble-args callback)))
+
+(defun dapdbg--parse-address (strval)
+  "Parse the given string into a number, accounting for hex numbers with leading `0x'."
+  (let  ((s-val (if (string= (downcase (substring strval 0 2)) "0x")
+                    (substring strval 2)
+                  strval)))
+    (string-to-number s-val 16)))
 
 ;; ------------------- internal requests ---------------------
 
@@ -559,24 +582,6 @@ onto the start of the next message."
                                 (if is-request 'dapdbg-request-face 'dapdbg-response-face)))
       (goto-char (point-max))
       )))
-
-(defun dapdbg--request-disassembly (callback mem-ref &optional instructions-preceeding instruction-count)
-  "Get disassembly for the given session, for the optional
-   address range (defaults to 64 instructions either side of the
-   instruction pointer)."
-  (unless (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
-    (error "disassemble request is not supported by this debug adapter"))
-  (let ((disassemble-args (list :memoryReference (format "0x%x" mem-ref)
-                                :instructionOffset (or instructions-preceeding -63)
-                                :instructionCount (or instruction-count 64))))
-    (dapdbg--send-request "disassemble" disassemble-args
-                          (lambda (msg) (funcall callback (gethash "instructions" (gethash "body" msg)))))))
-
-(defun dapdbg--parse-address (strval)
-  (let  ((s-val (if (string= (downcase (substring strval 0 2)) "0x")
-                    (substring strval 2)
-                  strval)))
-    (string-to-number s-val 16)))
 
 (defun dapdbg---print-capabilities ()
   "List the capabilities of the current debugger.
