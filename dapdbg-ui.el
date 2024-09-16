@@ -292,8 +292,9 @@ accounting for existing breakpoint markers."
              (lambda (frame)
                (cl-incf idx)
                (let ((id (gethash "id" frame))
-                     (iptr (substring (gethash "instructionPointerReference" frame) 2))
+                     (iptr (gethash "instructionPointerReference" frame))
                      (name (gethash "name" frame)))
+                 (setq iptr (if iptr (substring iptr 2) "<unknown>"))
                  (list id (vector
                            (propertize (format "%d" idx) 'face 'font-lock-variable-name-face)
                            (propertize iptr 'face 'font-lock-number-face)
@@ -331,16 +332,18 @@ event. This causes a chain of updates to occur in various panels."
 stack, which may be a partially-unwound portion of the stack that
 the debugee is current stopped at."
   ;; create a "stack path" from the current call-stack to serve as an ID for caching variables etc:
-  (let ((call-stack-id (string-join (nreverse (mapcar (lambda (f) (gethash "name" f)) call-stack)) "/"))
-        (frame (car call-stack)))
+  (let* ((call-stack-id (string-join (nreverse (mapcar (lambda (f) (gethash "name" f)) call-stack)) "/"))
+         (frame (car call-stack))
+         (ip-ref (gethash "instructionPointerReference" frame)))
     (dapdbg-ui--invalidate-variables-buffers call-stack-id)
     (dapdbg--request-scopes (gethash "id" frame)
                             (apply-partially #'dapdbg-ui--handle-scopes-response call-stack-id))
-    (dapdbg-ui--handle-program-counter-updated (dapdbg--parse-address (gethash "instructionPointerReference" frame)))
+    (when ip-ref
+      (dapdbg-ui--handle-program-counter-updated (dapdbg--parse-address ip-ref)))
     (when-let ((source (gethash "source" frame)))
       (let ((filename (gethash "path" source))
             (linenumber (gethash "line" frame)))
-        (when (file-exists-p filename)
+        (when (and filename (file-exists-p filename))
           (with-current-buffer (find-file-noselect filename)
             (dapdbg-ui-mode t)
             (dapdbg-ui-mode--set-source-line-marker (current-buffer) linenumber))))
