@@ -67,13 +67,14 @@ information. It includes a keymap for basic debugger control."
 (defvar-keymap dapdbg-ui-call-stack-mode-map
   :doc "Local keymap for `STrace' buffers."
   :parent tabulated-list-mode-map
-  "RET" #'dapdbg-ui--switch-stackframe)
+  "RET" #'dapdbg-ui--select-stack-frame)
 
 (define-derived-mode dapdbg-ui-call-stack-mode tabulated-list-mode "stack"
   "Major mode for stack trace display"
   :interactive nil
   (setq tabulated-list-format
-        (vector '("Prog Counter" 12 nil :right-align t)
+        (vector '("Idx" 3 nil :right-align t)
+                '("Prog Counter" 12 nil :right-align t)
                 '("Function" 999 nil)))
   (tabulated-list-init-header))
 
@@ -113,48 +114,83 @@ information. It includes a keymap for basic debugger control."
      (dapdbg-ui--output (format "> %s\n" expr) "repl-input")
      (dapdbg-ui--output (gethash "result" (gethash "body" parsed-msg))))))
 
-;; ------------------- margin stuff ---------------------
+;; ------------------- marker and margin stuff ---------------------
 
-(defvar dapdbg-ui--marker-overlay nil)
+;; Displaying something in the margin is not straightforward - if you just add a
+;; margin property to the existing buffer text on that line, the text will
+;; dissapear (it is "replaced" by the margin property). The suggested workaround
+;; in the elisp manual is to create a (possibly invisible) overlay on that line,
+;; set a `before-string' property on the overlay, and set the margin property on
+;; *that* string. The contents of the before-string are therefore not important,
+;; because it will never actually be displayed.
+;;
+;; Because we already have an overlay for the source/instruction line, we can
+;; re-use it for the margin display trick.
+;;
+;; https://www.gnu.org/software/emacs/manual/html_node/elisp/Display-Margins.html
+
+(defvar dapdbg-ui--source-line-marker-overlay nil)
+(defvar dapdbg-ui--instruction-marker-overlay nil)
 
 (defun dapdbg-ui--set-left-margin (width)
+  "Display a margin of width WIDTH in the current buffer."
   (setq left-margin-width width)
   (let ((window (get-buffer-window (current-buffer) 0)))
     (if window
         (set-window-margins
          window left-margin-width right-margin-width))))
 
-(defun dapdbg-ui--make-margin-marker-properties (&optional breakpoint-p)
-  (list (list 'margin 'left-margin)
-        (propertize (if breakpoint-p ">" "=>") 'face 'dapdbg-ui-arrow-face)))
+(defun dapdbg-ui--make-margin-display-properties (margin-str)
+  "Make a display specification (a nested list) to display something in the margin."
+  (list (list 'margin 'left-margin) margin-str))
 
-(defun dapdbg-ui--make-marker-overlay (start end buf)
+(defun dapdbg-ui--make-overlay-for-margin (start end buf kind &optional face)
+  "Make an overlay which has the `before-string' property."
   (let ((olay (make-overlay start end))
         (invisible-str (make-string 1 ?x)))
-    (put-text-property 0 1 'display (dapdbg-ui--make-margin-marker-properties) invisible-str)
-    (overlay-put olay :kind 'marker)
-    (overlay-put olay 'face 'dapdbg-ui-marker-face)
     (overlay-put olay 'before-string invisible-str)
+    (overlay-put olay :kind kind)
+    (when face
+      (overlay-put olay 'face face))
     olay))
 
-(defun dapdbg-ui-mode--set-marker (buf linenumber)
-  (let ((bol 0))
-    (with-current-buffer buf
-      (save-excursion
-        (save-restriction
-          (widen)
-          (goto-char (point-min))
-          (forward-line (1- linenumber))
-          (setq bol (line-beginning-position))
-          (let* ((eol (line-end-position))
-                 (breakpointp (cl-some (lambda (olay) (eq (overlay-get olay :kind) 'breakpoint))
-                                       (overlays-in bol eol))))
-            (if dapdbg-ui--marker-overlay
-                (move-overlay dapdbg-ui--marker-overlay bol eol buf)
-              (setq dapdbg-ui--marker-overlay
-                    (dapdbg-ui--make-marker-overlay bol eol buf)))
-            (put-text-property 0 1 'display (dapdbg-ui--make-margin-marker-properties breakpointp)
-                               (overlay-get dapdbg-ui--marker-overlay 'before-string))))))
+(defun dapdbg-ui--set-margin-str-for-overlay (olay margin-str)
+  (let ((invisible-str (overlay-get olay 'before-string)))
+    (put-text-property 0 1 'display (dapdbg-ui--make-margin-display-properties margin-str) invisible-str)))
+
+(defun dapdbg-ui--make-marker-overlay (start end buf)
+  (dapdbg-ui--make-overlay-for-margin start end buf 'marker 'dapdbg-ui-marker-face))
+
+(defun dapdbg-ui-mode--set-instruction-marker (buf)
+  "Move the instruction marker to the current point in BUF."
+  (unless dapdbg-ui--instruction-marker-overlay
+    (setq dapdbg-ui--instruction-marker-overlay
+          (dapdbg-ui--make-marker-overlay 0 0 buf)))
+  (dapdbg-ui-mode--set-marker-at-point buf dapdbg-ui--instruction-marker-overlay))
+
+(defun dapdbg-ui-mode--set-source-line-marker (buf linenumber)
+  "Move the source-line marker to the given line number in BUF."
+  (with-current-buffer buf
+    (save-excursion
+      (save-restriction
+        (widen)
+        (goto-char (point-min))
+        (forward-line (1- linenumber))
+        (unless dapdbg-ui--source-line-marker-overlay
+          (setq dapdbg-ui--source-line-marker-overlay
+                (dapdbg-ui--make-marker-overlay 0 0 buf)))
+        (dapdbg-ui-mode--set-marker-at-point buf dapdbg-ui--source-line-marker-overlay)))))
+
+(defun dapdbg-ui-mode--set-marker-at-point (buf marker-olay)
+  "Moves the given marker overlay to the current point in BUF,
+accounting for existing breakpoint markers."
+  (let ((bol (line-beginning-position)))
+    (let* ((eol (line-end-position))
+           (bp-flag (cl-some (lambda (olay) (eq (overlay-get olay :kind) 'breakpoint))
+                             (overlays-in bol eol)))
+           (arrow-str (propertize (if bp-flag ">" "=>") 'face 'dapdbg-ui-arrow-face)))
+      (move-overlay marker-olay bol eol buf)
+      (dapdbg-ui--set-margin-str-for-overlay marker-olay arrow-str))
     (unless (get-buffer-window buf "visible")
       (display-buffer buf))
     (with-selected-window (get-buffer-window buf)
@@ -169,16 +205,10 @@ information. It includes a keymap for basic debugger control."
         (widen)
         (goto-char (point-min))
         (forward-line (1- linenumber))
-        (let ((marker (if verified "B" "b")))
-          (let ((olay (make-overlay (point) (point)))
-                (invisible-str (make-string 1 ?x))
-                (marker-display-properties
-                 (list (list 'margin 'left-margin)
-                       (propertize marker 'face 'dapdbg-ui-breakpoint-face))))
-            (put-text-property 0 1 'display marker-display-properties invisible-str)
-            (overlay-put olay 'before-string invisible-str)
-            (overlay-put olay :kind 'breakpoint)
-            olay))))))
+        (let ((bp-str (propertize (if verified "B" "b") 'face 'dapdbg-ui-breakpoint-face))
+              (olay (dapdbg-ui--make-overlay-for-margin (point) (point) buf 'breakpoint)))
+          (dapdbg-ui--set-margin-str-for-overlay olay bp-str)
+          olay)))))
 
 (defun dapdbg-ui--clear-breakpoint-markers (buf)
   (with-current-buffer buf
@@ -238,25 +268,87 @@ information. It includes a keymap for basic debugger control."
 
 (defconst dapdbg-ui--call-stack-buffer-name "*Stack Frames*")
 
-(defun dapdbg-ui--call-stack-refresh (stacktrace)
+(defun dapdbg-ui--get-call-stack-buffer ()
   (let ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--call-stack-buffer-name)))
     (when (cdr buf-created)
       (with-current-buffer (car buf-created)
         (dapdbg-ui-call-stack-mode)
-        (font-lock-mode -1)))
-    (with-current-buffer (car buf-created)
+        (setq-local buffer-read-only t)
+        (font-lock-mode -1)
+        (make-variable-buffer-local 'current-thread-id)
+        (make-variable-buffer-local 'current-call-stack)
+        (setq-local marker-overlay (make-overlay 0 0))
+        (overlay-put marker-overlay :kind 'frame-marker)
+        (overlay-put marker-overlay 'face 'dapdbg-ui-marker-face)))
+    (car buf-created)))
+
+(defun dapdbg-ui--call-stack-display-update (call-stack)
+  "Update the table display in the call-stack buffer."
+  (let ((buf (dapdbg-ui--get-call-stack-buffer))
+        (idx -1))
+    (with-current-buffer buf
       (setq tabulated-list-entries
             (mapcar
              (lambda (frame)
+               (cl-incf idx)
                (let ((id (gethash "id" frame))
-                     (iptr (substring (gethash "instructionPointerReference" frame) 2))
+                     (iptr (gethash "instructionPointerReference" frame))
                      (name (gethash "name" frame)))
+                 (setq iptr (if iptr (substring iptr 2) "<unknown>"))
                  (list id (vector
+                           (propertize (format "%d" idx) 'face 'font-lock-variable-name-face)
                            (propertize iptr 'face 'font-lock-number-face)
                            (propertize name 'face 'font-lock-function-name-face)))))
-             stacktrace))
-      (tabulated-list-print))
-    (display-buffer (car buf-created))))
+             call-stack))
+      (tabulated-list-print)
+      (goto-char (point-min))
+      (display-buffer buf))))
+
+(defun dapdbg-ui--set-call-stack (thread-id call-stack)
+  "Set the current thread-id and call-stack, usually after a `stopped'
+event. This causes a chain of updates to occur in various panels."
+  (with-current-buffer (dapdbg-ui--get-call-stack-buffer)
+    (setq-local
+     current-thread-id thread-id
+     current-call-stack call-stack))
+  (dapdbg-ui--call-stack-display-update call-stack)
+  (dapdbg-ui--set-call-stack-context call-stack))
+
+(defun dapdbg-ui--select-stack-frame ()
+  "Select the frame at point in the call-stack buffer."
+  (interactive)
+  (with-current-buffer (dapdbg-ui--get-call-stack-buffer)
+    (let ((frame-id (tabulated-list-get-id))
+          (call-stack current-call-stack))
+      (while (and call-stack (/= frame-id (gethash "id" (car call-stack))))
+        (setq call-stack (cdr call-stack)))
+      (unless call-stack
+        (error "unable to find frame-id %d in current stack" frame-id))
+      (dapdbg-ui--set-call-stack-context call-stack)
+      (move-overlay marker-overlay (line-beginning-position) (line-end-position)))))
+
+(defun dapdbg-ui--set-call-stack-context (call-stack)
+  "Adjust various panels to show the context of the given call
+stack, which may be a partially-unwound portion of the stack that
+the debugee is current stopped at."
+  ;; create a "stack path" from the current call-stack to serve as an ID for caching variables etc:
+  (let* ((call-stack-id (string-join (nreverse (mapcar (lambda (f) (gethash "name" f)) call-stack)) "/"))
+         (frame (car call-stack))
+         (ip-ref (gethash "instructionPointerReference" frame)))
+    (dapdbg-ui--invalidate-variables-buffers call-stack-id)
+    (dapdbg--request-scopes (gethash "id" frame)
+                            (apply-partially #'dapdbg-ui--handle-scopes-response call-stack-id))
+    (when ip-ref
+      (dapdbg-ui--handle-program-counter-updated (dapdbg--parse-address ip-ref)))
+    (when-let ((source (gethash "source" frame)))
+      (let ((filename (gethash "path" source))
+            (linenumber (gethash "line" frame)))
+        (when (and filename (file-exists-p filename))
+          (with-current-buffer (find-file-noselect filename)
+            (dapdbg-ui-mode t)
+            (dapdbg-ui-mode--set-source-line-marker (current-buffer) linenumber))))
+      ;; TODO - remove marker if it was not set
+      )))
 
 ;; ------------------- variables & registers ---------------------
 
@@ -457,6 +549,70 @@ PARENT-ID provided in CHILD-LIST."
     (let ((buf (dapdbg-ui--get-variables-buffer (symbol-value buf-name))))
       (dapdbg-ui--invalidate-variables-buffer buf call-stack-id))))
 
+(defun dapdbg-ui--handle-scopes-response (call-stack-id parsed-msg)
+  (let ((scopes (gethash "scopes" (gethash "body" parsed-msg))))
+    (dolist (scope scopes)
+      (let ((kind (or (gethash "name" scope) (gethash "presentationHint" scope)))
+            (id (gethash "variablesReference" scope)))
+        (let ((processor
+               (pcase (downcase kind)
+                 ("registers" #'dapdbg-ui--registers-update)
+                 (_ #'dapdbg-ui--variables-update))))
+          (when processor
+            (let ((handler (lambda (parsed-msg1)
+                             (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
+                               (funcall processor call-stack-id kind vars)))))
+              (dapdbg--request-variables id handler))))))))
+
+;; ------------------- disassembly ---------------------
+
+(defconst dapdbg-ui--disassembly-buffer-name "*Disassembly*")
+
+(defun dapdbg-ui--get-disassembly-buffer ()
+  (let ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--disassembly-buffer-name)))
+    (when (cdr buf-created) ; freshly-opened
+      (with-current-buffer (car buf-created)
+        (asm-mode)
+        (dapdbg-ui--set-left-margin 2)
+        (font-lock-mode -1)
+        ;; do this after setting the major mode
+        (setq-local
+         address-bol-map (make-hash-table :test 'eql))))
+    (car buf-created)))
+
+(defun dapdbg-ui--disassembly-render (program-counter instructions)
+  (let ((buf (dapdbg-ui--get-disassembly-buffer)))
+    (with-current-buffer buf
+      (clrhash address-bol-map)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (dolist (instruction instructions)
+          (let* ((address-str (gethash "address" instruction))
+                 (pc (dapdbg--parse-address address-str))
+                 (line (format "%s: %s\n"
+                               address-str
+                               (gethash "instruction" instruction))))
+            (puthash pc (point) address-bol-map)
+            (insert (propertize line 'read-only t)))))
+      (font-lock-fontify-buffer)
+      (when-let ((marker-point (gethash program-counter address-bol-map)))
+        (goto-char marker-point)
+        (dapdbg-ui-mode--set-instruction-marker buf)))
+    (display-buffer buf)))
+
+(defun dapdbg-ui--handle-disassembly (ip-ref parsed-msg)
+  (let ((instructions (gethash "instructions" (gethash "body" parsed-msg))))
+    (dapdbg-ui--disassembly-render ip-ref instructions)))
+
+(defun dapdbg-ui--handle-program-counter-updated (program-counter)
+  (when (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
+    (with-current-buffer (dapdbg-ui--get-disassembly-buffer)
+      (if-let ((marker-point (gethash program-counter address-bol-map)))
+          (progn
+            (goto-char marker-point)
+            (dapdbg-ui-mode--set-instruction-marker (current-buffer)))
+        (dapdbg--request-disassembly program-counter nil (apply-partially #'dapdbg-ui--handle-disassembly program-counter))))))
+
 ;; ------------------- breakpoints ---------------------
 
 (defun dapdbg-ui--set-breakpoint-markers (buf source-table)
@@ -475,38 +631,12 @@ PARENT-ID provided in CHILD-LIST."
 
 ;; ------------------- callbacks ---------------------
 
-(defun dapdbg-ui--handle-scopes-response (call-stack-id parsed-msg)
-  (let ((scopes (gethash "scopes" (gethash "body" parsed-msg))))
-    (dolist (scope scopes)
-      (let ((kind (or (gethash "name" scope) (gethash "presentationHint" scope)))
-            (id (gethash "variablesReference" scope)))
-        (let ((processor
-               (pcase (downcase kind)
-                 ("registers" #'dapdbg-ui--registers-update)
-                 (_ #'dapdbg-ui--variables-update))))
-          (when processor
-            (let ((handler (lambda (parsed-msg1)
-                             (let ((vars (gethash "variables" (gethash "body" parsed-msg1))))
-                               (funcall processor call-stack-id kind vars)))))
-              (dapdbg--request-variables id handler))))))))
+(defun dapdbg-ui--handle-stacktrace-response (thread-id parsed-msg)
+  (let ((stack (gethash "stackFrames" (gethash "body" parsed-msg))))
+    (dapdbg-ui--set-call-stack thread-id stack)))
 
-(defun dapdbg-ui--handle-stacktrace-response (parsed-msg)
-  (let* ((stack (gethash "stackFrames" (gethash "body" parsed-msg)))
-         (ip-ref (gethash "instructionPointerReference" (car stack)))
-         (top-frame-id (gethash "id" (car stack)))
-         (source (gethash "source" (car stack))))
-    ;; create a "stack path" from the current call-stack to serve as an ID for caching variables etc:
-    (let ((call-stack-id (string-join (nreverse (mapcar (lambda (frame) (gethash "name" frame)) stack)) "/")))
-      (dapdbg-ui--invalidate-variables-buffers call-stack-id)
-      (dapdbg--request-scopes top-frame-id (apply-partially #'dapdbg-ui--handle-scopes-response call-stack-id)))
-    (when source
-      (let* ((filename (gethash "path" source))
-             (linenumber (gethash "line" (car stack)))
-             (buf (find-file-noselect filename)))
-        (with-current-buffer buf
-          (dapdbg-ui-mode t))
-        (dapdbg-ui-mode--set-marker buf linenumber)))
-    (dapdbg-ui--call-stack-refresh stack)))
+(defun dapdbg-ui--handle-threads-response (parsed-msg)
+  nil) ;; TODO
 
 (defun dapdbg-ui--handle-output-event (parsed-msg)
   (let ((body (gethash "body" parsed-msg)))
@@ -515,7 +645,9 @@ PARENT-ID provided in CHILD-LIST."
 (add-hook 'dapdbg--output-callback-list #'dapdbg-ui--handle-output-event)
 
 (defun dapdbg-ui--handle-stopped-event (_parsed-msg)
-  (dapdbg--request-stacktrace nil #'dapdbg-ui--handle-stacktrace-response))
+  ;; current thread ID has already been set on the session object
+  (dapdbg--request-stacktrace nil #'dapdbg-ui--handle-stacktrace-response)
+  (dapdbg--request-threads #'dapdbg-ui--handle-threads-response))
 
 (add-hook 'dapdbg--stopped-callback-list #'dapdbg-ui--handle-stopped-event)
 
@@ -534,6 +666,12 @@ PARENT-ID provided in CHILD-LIST."
      (display-buffer-in-side-window)
      (side . bottom)
      (slot . 1)))
+  (add-to-list
+   'display-buffer-alist
+   `(,dapdbg-ui--disassembly-buffer-name
+     (display-buffer-in-side-window)
+     (side . bottom)
+     (slot . 2)))
   (add-to-list
    'display-buffer-alist
    '((major-mode . dapdbg-ui-call-stack-mode)

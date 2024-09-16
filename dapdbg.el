@@ -37,27 +37,35 @@
 
 ;; ------------------- custom variables ---------------------
 
-(defvar dapdbg-lldb-command-line '("lldb-dap-18")
+(defcustom dapdbg-lldb-command-line '("lldb-dap-18")
   "Command-line to invoke the lldb debugger process.
 
 The LLDB debugger ships with a separate binary for the DAP server
 - on older versions this is called 'lldb-vscode', and it is
-called 'lldb-dap' since version 18.")
+called 'lldb-dap' since version 18."
+  :type `(repeat string))
 
-(defvar dapdbg-gdb-command-line '("gdb" "-i" "dap")
+(defcustom dapdbg-gdb-command-line '("rust-gdb" "-i" "dap")
   "Command-line to invoke the gdb debugger process.
 
 The GDB debugger implements the DAP interface with the
 command-line flags '-i dap'. Note that GDB supports DAP from
-version 14 onwards.")
+version 14 onwards."
+  :type `(repeat string))
 
-(defvar dapdbg-lldb-init-commands
+(defcustom dapdbg-lldb-init-commands
   '("command script import ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/etc/lldb_lookup.py"
     "command source ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/etc/lldb_commands")
-  "Additional properties to pass to the launch command.")
+  "Additional properties to pass to the launch command."
+  :type `(repeat string))
 
-(defvar dapdbg-gdb-init-commands nil
-  "Additional properties to pass to the launch command.")
+(defcustom dapdbg-gdb-init-commands nil
+  "Additional properties to pass to the launch command."
+  :type `(repeat string))
+
+(defcustom dapdbg-page-size 4096
+  "Page size on the machine being debugged, used for fetching disassembly and raw memory."
+  :type 'natnum)
 
 ;; ------------------- initialization and session ---------------------
 
@@ -228,18 +236,21 @@ https://microsoft.github.io/debug-adapter-protocol/specification#Requests_Initia
 
 ;; ------------------- commands ---------------------
 
-(defmacro dapdbg--make-thread-command (name command docstring &optional args)
+(defmacro dapdbg--make-thread-command (name command docstring &optional args capability)
   `(defun ,(intern (format "dapdbg-%s" name)) ()
      ,docstring
      (interactive)
+     ,(if capability
+          `(unless (gethash ,capability (dapdbg-session-capabilities dapdbg--ssn))
+             (error "Debugger does not have capability: \"%s\"" ,capability)))
      (let ((pargs (list :threadId (dapdbg-session-thread-id dapdbg--ssn))))
        ,(when args `(nconc pargs ,args))
        (dapdbg--send-request ,command pargs))))
 
 (dapdbg--make-thread-command "next" "next" "Step one line (skip functions).")
-(dapdbg--make-thread-command "nexti" "next" "Step one instruction (skip functions)." '(:granularity "instruction"))
+(dapdbg--make-thread-command "nexti" "next" "Step one instruction (skip functions)." '(:granularity "instruction") "supportsSteppingGranularity")
 (dapdbg--make-thread-command "step" "stepIn" "Step one source line.")
-(dapdbg--make-thread-command "stepi" "stepIn" "Step one instruction." '(:granularity "instruction"))
+(dapdbg--make-thread-command "stepi" "stepIn" "Step one instruction." '(:granularity "instruction") "supportsSteppingGranularity")
 (dapdbg--make-thread-command "finish" "stepOut" "Finish executing the current function.")
 (dapdbg--make-thread-command "continue" "continue" "Resume exceution.")
 
@@ -328,13 +339,52 @@ filenames, then call any final callback."
       (puthash linenumber bp-details source-table))
     (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table)))
 
+;; ------------------- disassembly ---------------------
+
+;; The "offset" and "instructionOffset" arguments cannot be trusted (at the time
+;; of writing).
+;;
+;; LLDB ignores the offset argument and treats the instructionOffset as a byte
+;; offset. https://github.com/llvm/llvm-project/blob/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap/lldb-dap.cpp#L4089.
+;;
+;; GDB fetches data at a start address accounting for the (byte) offset, but
+;; indexes into the resulting array using the instruction offset, which
+;; therefore cannot be used as a negative offset from the start
+;; address. https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=gdb/python/lib/gdb/dap/disassemble.py;h=a2e27e54a6408487f8c32b358389fd21b3eac179;hb=refs/heads/master#l74
+;;
+;; Therefore (because instruction size and aligment are very platform-dependent)
+;; we cannot really guess any start address for our block before the current
+;; instruction pointer. This is a shame as it is generaly nice to be able to see
+;; the prevoius instructions, for context.
+
+(defun dapdbg--request-disassembly (program-counter &optional instruction-count callback)
+  "Get disassembly for INSTRUCTION-COUNT instructions starting at PROGRAM-COUNTER."
+  (unless (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
+    (error "disassemble request is not supported by the current debugger"))
+  (let* ((disassemble-args (list :memoryReference (format "0x%x" program-counter)
+                                 :instructionCount (or instruction-count 128))))
+    (dapdbg--send-request "disassemble" disassemble-args callback)))
+
+(defun dapdbg--parse-address (strval)
+  "Parse the given string into a number, accounting for hex numbers with leading `0x'."
+  (let  ((s-val (if (string= (downcase (substring strval 0 2)) "0x")
+                    (substring strval 2)
+                  strval)))
+    (string-to-number s-val 16)))
+
 ;; ------------------- internal requests ---------------------
 
+(defun dapdbg--request-threads (&optional callback)
+  (dapdbg--send-request "threads" nil callback))
+
 (defun dapdbg--request-stacktrace (&optional thread-id callback)
+  "Request a stacktrace for THREAD-ID (defaults to currnt
+thread). CALLBACK will be called with 2 arguments: thread-id and
+the `StackTraceResponse' parsed message."
   (let ((tid thread-id))
     (unless tid
       (setq tid (dapdbg-session-thread-id dapdbg--ssn)))
-    (dapdbg--send-request "stackTrace" (list :threadId tid) callback)))
+    (dapdbg--send-request "stackTrace" (list :threadId tid) (apply-partially callback tid))))
 
 (defun dapdbg--request-scopes (frame-id callback)
   (dapdbg--send-request "scopes" (list :frameId frame-id) callback))
@@ -419,7 +469,7 @@ by the DAP protocol
 
 (defun dapdbg--send-request (command &optional args callback)
   (pcase-let ((`(:header ,hdrs :body ,body :seq ,seq) (dapdbg--create-request command args)))
-    (dapdbg--io-message hdrs body t)
+    (dapdbg--log-io-message hdrs body t)
     (if callback
         (dapdbg--register-callback seq callback))
     (process-send-string (dapdbg-session-process dapdbg--ssn) (format "%s\r\n%s" hdrs body))))
@@ -503,14 +553,14 @@ onto the start of the next message."
         (unless (>= (length msg) (1- end))
           (throw 'incomplete 'dapdbg--not-parsed-response))
         (let ((body (substring msg beg end)))
-          (dapdbg--io-message hdrs body nil)
+          (dapdbg--log-io-message hdrs body nil)
           (list
            :parsed-length end
            :parsed-msg (dapdbg--parse-json (substring body 0 content-length))))))))
 
 ;; ------------------- internal tools ---------------------
 
-(defcustom dapdbg-io-print-flag nil
+(defcustom dapdbg-io-log-flag nil
   "Enables output of request & response messages to/from the DAP
    server (only useful for debugging this package)"
   :type 'boolean)
@@ -530,7 +580,7 @@ onto the start of the next message."
         (cons buf nil)
       (cons (get-buffer-create buf-name) t))))
 
-(defun dapdbg--io-buf ()
+(defun dapdbg--get-io-log-buffer ()
   "Buffer to display request/response messages if dapdbg-print-io is t"
   (let ((buf-created (dapdbg--get-or-create-buffer "*dapdbg IO*")))
     (when (cdr buf-created)
@@ -539,9 +589,9 @@ onto the start of the next message."
         (font-lock-mode -1)))
     (car buf-created)))
 
-(defun dapdbg--io-message (hdrs msg is-request)
-  (when dapdbg-io-print-flag
-    (with-current-buffer (dapdbg--io-buf)
+(defun dapdbg--log-io-message (hdrs msg is-request)
+  (when dapdbg-io-log-flag
+    (with-current-buffer (dapdbg--get-io-log-buffer)
       (goto-char (point-max))
       (let ((beg (point)))
         (insert (format "- %s -----------------------------------\n" (if is-request "TX" "RX")))
@@ -559,24 +609,6 @@ onto the start of the next message."
                                 (if is-request 'dapdbg-request-face 'dapdbg-response-face)))
       (goto-char (point-max))
       )))
-
-(defun dapdbg--request-disassembly (callback mem-ref &optional instructions-preceeding instruction-count)
-  "Get disassembly for the given session, for the optional
-   address range (defaults to 64 instructions either side of the
-   instruction pointer)."
-  (unless (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
-    (error "disassemble request is not supported by this debug adapter"))
-  (let ((disassemble-args (list :memoryReference (format "0x%x" mem-ref)
-                                :instructionOffset (or instructions-preceeding -63)
-                                :instructionCount (or instruction-count 64))))
-    (dapdbg--send-request "disassemble" disassemble-args
-                          (lambda (msg) (funcall callback (gethash "instructions" (gethash "body" msg)))))))
-
-(defun dapdbg--parse-address (strval)
-  (let  ((s-val (if (string= (downcase (substring strval 0 2)) "0x")
-                    (substring strval 2)
-                  strval)))
-    (string-to-number s-val 16)))
 
 (defun dapdbg---print-capabilities ()
   "List the capabilities of the current debugger.
