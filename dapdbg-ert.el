@@ -29,14 +29,15 @@ Accept: application/json
 {\"event\":\"xinitialized\",\"seq\":0,\"type\":\"event\"}"))
      (should (equal '(99 210 69) (dapdbg--handle-server-message nil msg))))))
 
-(ert-deftest can-route-callback ()
+(ert-deftest can-route-success-callback ()
   (with-test-setup
    (let* ((cb-value nil)
           (seq-number 345)
-          (test-message (list :foo "bar" :type "response" :request_seq seq-number)))
+          (test-message (list :foo "bar" :type "response" :success t :request_seq seq-number)))
      (pcase-let ((`(:header ,hdrs :body ,body :seq ,seq) (dapdbg--base-protocol test-message nil)))
        (dapdbg--register-callback
         seq-number (lambda (msg)
+                     (message "called back: %s" msg)
                      (setq cb-value (gethash "foo" msg))))
        (dapdbg--handle-server-message nil (format "%s\r\n%s" hdrs body))
        (should (string= "bar" cb-value))

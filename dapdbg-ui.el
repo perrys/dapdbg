@@ -17,6 +17,20 @@
   '((t :inherit (error)))
   "Face for breakpoint markers")
 
+;; ------------------- custom variables ---------------------
+
+(defcustom dapdbg-ui-input-ring-size 64
+  "Length of command-history for the I/O buffer"
+  :type 'natnum)
+
+(defcustom dapdbg-ui-address-format "%013x"
+  "Format for addresses to be printed in various panels.
+
+The default is 13 hex characters (zero-padded), which is enough
+to display 52-bit addresses. You may need to widen this for some
+architectures."
+  :type 'natnum)
+
 ;; ------------------- modes ---------------------
 
 (defvar-keymap dapdbg-ui-mode-map
@@ -72,20 +86,18 @@ information. It includes a keymap for basic debugger control."
 (define-derived-mode dapdbg-ui-call-stack-mode tabulated-list-mode "stack"
   "Major mode for stack trace display"
   :interactive nil
-  (setq tabulated-list-format
-        (vector '("Idx" 3 nil :right-align t)
-                '("Prog Counter" 12 nil :right-align t)
-                '("Function" 999 nil)))
+  (let ((addr-width (length (format dapdbg-ui-address-format 0))))
+    (message "width: %d" addr-width)
+    (setq tabulated-list-format
+          (vector '("Idx" 3 nil :right-align t)
+                  `("Prog Counter" ,(if (> addr-width 1) addr-width 16) nil :right-align t)
+                  '("Function" 999 nil))))
   (tabulated-list-init-header))
 
 (defvar-keymap dapdbg-ui-output-mode-map
   :doc "Local keymap for `dapdbg I/O' buffers."
   "M-p" #'dapdbg-ui-previous-input
   "RET" #'dapdbg-ui-send-input)
-
-(defcustom dapdbg-ui-input-ring-size 64
-  "Length of command-history for the I/O buffer"
-  :type 'integer)
 
 (define-derived-mode dapdbg-ui-output-mode fundamental-mode "dbgIO"
   "Major mode for the debugger REPL and process output"
@@ -156,7 +168,9 @@ information. It includes a keymap for basic debugger control."
 
 (defun dapdbg-ui--set-margin-str-for-overlay (olay margin-str)
   (let ((invisible-str (overlay-get olay 'before-string)))
-    (put-text-property 0 1 'display (dapdbg-ui--make-margin-display-properties margin-str) invisible-str)))
+    (put-text-property 0 1 'display
+                       (dapdbg-ui--make-margin-display-properties margin-str)
+                       invisible-str)))
 
 (defun dapdbg-ui--make-marker-overlay (start end buf)
   (dapdbg-ui--make-overlay-for-margin start end buf 'marker 'dapdbg-ui-marker-face))
@@ -292,12 +306,13 @@ accounting for existing breakpoint markers."
              (lambda (frame)
                (cl-incf idx)
                (let ((id (gethash "id" frame))
-                     (iptr (gethash "instructionPointerReference" frame))
+                     (pc (gethash "instructionPointerReference" frame))
                      (name (gethash "name" frame)))
-                 (setq iptr (if iptr (substring iptr 2) "<unknown>"))
+                 (when pc
+                   (setq pc (dapdbg--parse-address pc)))
                  (list id (vector
                            (propertize (format "%d" idx) 'face 'font-lock-variable-name-face)
-                           (propertize iptr 'face 'font-lock-number-face)
+                           (propertize (if pc (dapdbg-ui--addr pc) "<unknown>") 'face 'font-lock-number-face)
                            (propertize name 'face 'font-lock-function-name-face)))))
              call-stack))
       (tabulated-list-print)
@@ -577,32 +592,98 @@ PARENT-ID provided in CHILD-LIST."
         (font-lock-mode -1)
         ;; do this after setting the major mode
         (setq-local
-         address-bol-map (make-hash-table :test 'eql))))
+         address-bol-map (make-hash-table :test 'eql)
+         instruction-cache (make-hash-table :test 'eql))))
     (car buf-created)))
 
-(defun dapdbg-ui--disassembly-render (program-counter instructions)
+(defun dapdbg-ui--mapchain (table key key-prop &optional max-count already-reversed-flag)
+  "Return the list of elements from TABLE following the list implied
+by the KEY-PROP property of each element, starting at KEY."
+  (let ((result nil)
+        (counter 0))
+    (while-let ((current (and (or (null max-count) (< counter max-count))
+                              (gethash key table))))
+      (setq result (cons current result))
+      (setq key (plist-get current key-prop))
+      (setq counter (1+ counter)))
+    (if already-reversed-flag
+        result
+      (nreverse result))))
+
+(defun dapdbg-ui--update-instruction-cache (instructions i-cache)
+  "Add INSTRUCTIONS to the cache, with each entry in the
+cache forming a doubly-linked list to the previous and next
+instruction addresses. Stop if the instruction list overlaps with
+an existing set of instructions, and join the linked-lists at
+that point)."
+  (let ((last-instruction nil)
+        (current-instruction nil)
+        (started-new-list-flag nil))
+    (catch 'joined-to-existing-list
+      (dolist (instruction instructions)
+        (setq last-instruction current-instruction)
+        (let ((addr (dapdbg--parse-address (gethash "address" instruction))))
+          (if-let ((existing-instruction (gethash addr i-cache)))
+              (progn
+                (setq current-instruction existing-instruction)
+                (when last-instruction
+                  (plist-put last-instruction :next addr)
+                  (plist-put existing-instruction :prev (plist-get last-instruction :addr)))
+                (when started-new-list-flag
+                  (throw 'joined-to-existing-list nil)))
+            ;; this is a previously-unseen address
+            (setq current-instruction
+                  (list :addr addr :prev nil :next nil :data instruction))
+            (setq started-new-list-flag t)
+            (when last-instruction
+              (plist-put last-instruction :next addr)
+              (plist-put current-instruction :prev (plist-get last-instruction :addr)))
+            (puthash addr current-instruction i-cache)))))))
+
+(defun dapdbg-ui--addr (address)
+  (format dapdbg-ui-address-format address))
+
+(defun dapdbg-ui--render-instruction-line (cache-entry)
+  "Insert text for the instruction in CACHE-ENTRY into the current
+buffer. Return the beginning of line mark."
+  (let* ((pc (plist-get cache-entry :addr))
+         (instruction (plist-get cache-entry :data))
+         (line (format "%s: %s\n" (dapdbg-ui--addr pc) (gethash "instruction" instruction))))
+    (if-let ((symbol (gethash "symbol" instruction)))
+        (insert (propertize (format "\n%s: <%s>\n" (dapdbg-ui--addr pc) symbol) 'read-only t)))
+    (let ((saved-point (point)))
+      (insert (propertize line 'read-only t))
+      saved-point)))
+
+(defun dapdbg-ui--disassembly-render (program-counter)
+  "Clear and repopulate the disassembly buffer with instructions
+from the instruction cache around PROGRAM-COUNTER."
   (let ((buf (dapdbg-ui--get-disassembly-buffer)))
     (with-current-buffer buf
       (clrhash address-bol-map)
-      (let ((inhibit-read-only t))
+      (let ((inhibit-read-only t)
+            (prev-instructions (dapdbg-ui--mapchain instruction-cache program-counter :prev 64 t))
+            (instructions (dapdbg-ui--mapchain instruction-cache program-counter :next 64)))
         (erase-buffer)
-        (dolist (instruction instructions)
-          (let* ((address-str (gethash "address" instruction))
-                 (pc (dapdbg--parse-address address-str))
-                 (line (format "%s: %s\n"
-                               address-str
-                               (gethash "instruction" instruction))))
-            (puthash pc (point) address-bol-map)
-            (insert (propertize line 'read-only t)))))
+        (dolist (instruction prev-instructions)
+          (let ((addr (plist-get instruction :addr))
+                (bol (dapdbg-ui--render-instruction-line instruction)))
+            (puthash addr bol address-bol-map)))
+        (dolist (instruction (cdr instructions))
+          (let ((addr (plist-get instruction :addr))
+                (bol (dapdbg-ui--render-instruction-line instruction)))
+            (puthash addr bol address-bol-map))))
       (font-lock-fontify-buffer)
       (when-let ((marker-point (gethash program-counter address-bol-map)))
         (goto-char marker-point)
         (dapdbg-ui-mode--set-instruction-marker buf)))
     (display-buffer buf)))
 
-(defun dapdbg-ui--handle-disassembly (ip-ref parsed-msg)
-  (let ((instructions (gethash "instructions" (gethash "body" parsed-msg))))
-    (dapdbg-ui--disassembly-render ip-ref instructions)))
+(defun dapdbg-ui--handle-disassembly (pc parsed-msg)
+  (let ((instructions (gethash "instructions" (gethash "body" parsed-msg)))
+        (i-cache (with-current-buffer (dapdbg-ui--get-disassembly-buffer) instruction-cache)))
+    (dapdbg-ui--update-instruction-cache instructions i-cache)
+    (dapdbg-ui--disassembly-render pc)))
 
 (defun dapdbg-ui--handle-program-counter-updated (program-counter)
   (when (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
