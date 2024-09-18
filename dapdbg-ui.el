@@ -90,7 +90,7 @@ information. It includes a keymap for basic debugger control."
     (message "width: %d" addr-width)
     (setq tabulated-list-format
           (vector '("Idx" 3 nil :right-align t)
-                  `("Prog Counter" ,(if (> addr-width 1) addr-width 16) nil :right-align t)
+                  `("Prog Counter" ,(if (> addr-width 1) addr-width 16) nil)
                   '("Function" 999 nil))))
   (tabulated-list-init-header))
 
@@ -350,7 +350,7 @@ the debugee is current stopped at."
   (let* ((call-stack-id (string-join (nreverse (mapcar (lambda (f) (gethash "name" f)) call-stack)) "/"))
          (frame (car call-stack))
          (ip-ref (gethash "instructionPointerReference" frame)))
-    (dapdbg-ui--invalidate-variables-buffers call-stack-id)
+    (dapdbg-ui--reset-variables-buffers call-stack-id)
     (dapdbg--request-scopes (gethash "id" frame)
                             (apply-partially #'dapdbg-ui--handle-scopes-response call-stack-id))
     (when ip-ref
@@ -529,40 +529,37 @@ PARENT-ID provided in CHILD-LIST."
           (dapdbg-ui--refresh-variables-display)))) ; at a leaf node
     (display-buffer buf)))
 
-(defmacro dapdbg-ui--make-variables-update-fn (short-name docstring buf-name)
-  (let ((fn-symbol (intern (format "dapdbg-ui--%s-update" short-name))))
-    `(defun ,fn-symbol (call-stack-id parent-id child-list)
-       ,docstring
-       (dapdbg-ui--variables-refresh call-stack-id parent-id child-list
-                                     ,buf-name))))
-
 (defconst dapdbg-ui--variables-buffer-name "*Variables*")
 (defconst dapdbg-ui--registers-buffer-name "*Registers*")
 
-(dapdbg-ui--make-variables-update-fn
- "variables"
- "Update variables buffer with (partial) tree data"
- dapdbg-ui--variables-buffer-name)
+(defun dapdbg-ui--registers-update (_call-stack-id parent-id child-list)
+  "Update registers buffer with (partial) tree data"
+  (with-current-buffer dapdbg-ui--registers-buffer-name
+    (setq-local current-call-stack-id "registers"))
+  (dapdbg-ui--variables-refresh "registers" parent-id child-list
+                                dapdbg-ui--registers-buffer-name))
 
-(dapdbg-ui--make-variables-update-fn
- "registers"
- "Buffer to display register list"
- dapdbg-ui--registers-buffer-name)
+(defun dapdbg-ui--variables-update (call-stack-id parent-id child-list)
+  "Update variables buffer with (partial) tree data"
+  (dapdbg-ui--variables-refresh call-stack-id parent-id child-list
+                                dapdbg-ui--variables-buffer-name))
 
 (defun dapdbg-ui--invalidate-variables-buffer (buf call-stack-id)
   "Invalidate the root of the variables tree - normally called from a stopped event."
-  (with-current-buffer buf
-    (setq-local current-call-stack-id call-stack-id)
-    (when-let ((var-tree (dapdbg-ui--get-tree-for-call-stack call-stack-id)))
-      (let ((var-map (dapdbg-ui--var-tree-table var-tree)))
-        (dolist (id (dapdbg-ui--var-tree-root-ids var-tree))
-          (let ((var-obj (gethash id var-map)))
-            (puthash :valid nil var-obj)))))))
+  (when-let ((var-tree (dapdbg-ui--get-tree-for-call-stack call-stack-id)))
+    (let ((var-map (dapdbg-ui--var-tree-table var-tree)))
+      (dolist (id (dapdbg-ui--var-tree-root-ids var-tree))
+        (let ((var-obj (gethash id var-map)))
+          (puthash :valid nil var-obj))))))
 
-(defun dapdbg-ui--invalidate-variables-buffers (call-stack-id)
+(defun dapdbg-ui--reset-variables-buffers (call-stack-id)
   (dolist (buf-name '(dapdbg-ui--variables-buffer-name dapdbg-ui--registers-buffer-name))
     (let ((buf (dapdbg-ui--get-variables-buffer (symbol-value buf-name))))
-      (dapdbg-ui--invalidate-variables-buffer buf call-stack-id))))
+      (with-current-buffer buf
+        (if (equal buf-name dapdbg-ui--registers-buffer-name)
+            (setq-local current-call-stack-id "registers")
+          (setq-local current-call-stack-id call-stack-id)
+          (dapdbg-ui--invalidate-variables-buffer buf call-stack-id))))))
 
 (defun dapdbg-ui--handle-scopes-response (call-stack-id parsed-msg)
   (let ((scopes (gethash "scopes" (gethash "body" parsed-msg))))
