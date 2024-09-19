@@ -129,7 +129,7 @@ breakpoints and latest thread/stack state when stopped."
   "Send an initialize request - this is stage 1 of the
 initialization process. See
 https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
-  (let ((arguments (list
+  (let ((launch-args (list
                     :name (file-name-nondirectory program)
                     :type (plist-get debugger-plist :type)
                     :request "launch"
@@ -137,10 +137,10 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
                     (plist-get debugger-plist :stop-on-entry-sym) t))
         (init-commands (symbol-value (plist-get debugger-plist :init-commands-sym))))
     (when program-arguments
-      (plist-put arguments :args program-arguments))
+      (plist-put launch-args :args program-arguments))
     (when init-commands
-      (plist-put arguments :initCommands init-commands))
-    (setf (dapdbg-session-launch-args dapdbg--ssn) arguments))
+      (plist-put launch-args :initCommands init-commands))
+    (setf (dapdbg-session-launch-args dapdbg--ssn) launch-args))
   (let ((args (list
                :clientID "dapdbg"
                :clientName "dapdbg"
@@ -188,11 +188,7 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
       (unless (gethash cap caps)
         (dapdbg-disconnect)
         (error "Debugger does not have capability \"%s\"" cap)))
-    (setf (dapdbg-session-capabilities dapdbg--ssn) caps))
-  (unless (dapdbg-session-sends-initialized-event dapdbg--ssn)
-    ;; For GDB we just wait for the initialized event, but LLDB seems to require
-    ;; things in an order which doesn't match the spec
-    (dapdbg--set-all-breakpoints #'dapdbg--request-launch-then-configuration-done)))
+    (setf (dapdbg-session-capabilities dapdbg--ssn) caps)))
 
 (defun dapdbg--request-launch-then-configuration-done ()
   (let ((args (dapdbg-session-launch-args dapdbg--ssn)))
@@ -214,17 +210,8 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
   (dapdbg--send-request "configurationDone" nil #'dapdbg--handle-response-configdone))
 
 (defun dapdbg--handle-event-initialized (parsed-msg)
-  "Once the intialized event is recieved - set any breakpoints, then
-proceed with the initialization sequence."
-  (when (dapdbg-session-sends-initialized-event dapdbg--ssn)
-    (dapdbg--set-all-breakpoints #'dapdbg--request-configuration-done)))
-
-(defun dapdbg--initialized-p ()
-  "Check that the debugger is alive and has initialized. See
-https://microsoft.github.io/debug-adapter-protocol/specification#Requests_Initialize."
-  (and dapdbg--ssn
-       (process-live-p (dapdbg-session-process dapdbg--ssn))
-       (dapdbg-session-capabilities dapdbg--ssn)))
+  "Once the intialized event is recieved - set exception behaviour and any breakpoints."
+ (dapdbg--set-all-breakpoints #'dapdbg--request-configuration-done))
 
 (defun dapdbg-quit ()
   "Shut down and disconnect from the currently running DAP server (if any)."
@@ -468,11 +455,32 @@ by the DAP protocol
   (puthash seq callback (dapdbg-session-callbacks dapdbg--ssn)))
 
 (defun dapdbg--send-request (command &optional args callback)
+  "Send a requests of type COMMAND to the debugger, ARGS is the set
+of arguments as a plist."
   (pcase-let ((`(:header ,hdrs :body ,body :seq ,seq) (dapdbg--create-request command args)))
     (dapdbg--log-io-message hdrs body t)
     (if callback
         (dapdbg--register-callback seq callback))
     (process-send-string (dapdbg-session-process dapdbg--ssn) (format "%s\r\n%s" hdrs body))))
+
+(defun dapdbg--chain-requests (requests)
+  "Excecute a set of requests in sequence. Each element of REQUESTS
+is a plist with properties `:command' (request type),
+`:args' (arguments to the request) and `:callback' (function to
+call with the result), invoking `dapdbg--send-request' each time."
+  (pcase-let ((`(:command ,req-type :args ,req-args :callback ,callback) (car requests)))
+    (let ((remaining (cdr requests))
+          (handler (lambda (parsed-msg)
+                     (when callback
+                       (funcall callback parsed-msg))
+                     (when remaining
+                       dapdbg--chain-requests(remaining)))))
+      (dapdbg--send-request req-type req-args #'handler))))
+        
+(defcustom dapdbg-io-log-flag nil
+  "Enables output of request & response messages to/from the DAP
+   server (only useful for debugging this package)"
+  :type 'boolean)
 
 (defun dapdbg--handle-event (parsed-msg)
   (pcase (gethash "event" parsed-msg)
@@ -517,7 +525,7 @@ by the DAP protocol
             (setf (dapdbg-session-buffer dapdbg--ssn) remaining)
             (throw 'incomplete-msg nil))))
       (setf (dapdbg-session-buffer dapdbg--ssn) "")
-      (reverse chunks))))
+      (nreverse chunks))))
 
 (defun dapdbg--parse-json (str)
   (let* ((json-array-type 'list)
@@ -559,11 +567,6 @@ onto the start of the next message."
            :parsed-msg (dapdbg--parse-json (substring body 0 content-length))))))))
 
 ;; ------------------- internal tools ---------------------
-
-(defcustom dapdbg-io-log-flag nil
-  "Enables output of request & response messages to/from the DAP
-   server (only useful for debugging this package)"
-  :type 'boolean)
 
 (defface dapdbg-request-face
   '((t :inherit (warning)))

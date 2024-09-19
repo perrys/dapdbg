@@ -41,3 +41,26 @@ Accept: application/json
        (dapdbg--handle-server-message nil (format "%s\r\n%s" hdrs body))
        (should (string= "bar" cb-value))
        ))))
+
+(defmacro with-processor (processor-fn)
+  `(progn
+    (advice-add #'process-send-string :override ,advice-fn)
+    (funcall processor-fn)
+    (advice-remove #'dapdbg--send-request ,advice-fn)))
+
+(ert-deftest can-chain-requests ()
+  (let ((proc-fn
+         (lambda (req-str)
+           (let* ((in-msg (dapdbg--parse-message req-str))
+                  (req-seq (gethash "req" in-msg)))
+             (let* ((response (list :request_seq req_seq, :success t)))
+               (dapdbg--handle-server-message nil response))))))
+    (let ((responses nil))
+    (with-processor #'proc-fn
+       (dapdbg--chain-requests
+        (list (list :command "threads" :args nil
+                    :callback (lambda (_) (setq responses (cons "threads" responses))))
+                                 ))))
+    (should (equal responses '("threads")))))
+
+                          
