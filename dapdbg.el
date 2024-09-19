@@ -362,6 +362,7 @@ filenames, then call any final callback."
   (unless (gethash "supportsDisassembleRequest" (dapdbg-session-capabilities dapdbg--ssn))
     (error "disassemble request is not supported by the current debugger"))
   (let* ((disassemble-args (list :memoryReference (format "0x%x" program-counter)
+                                 :resolveSymbols t
                                  :instructionCount (or instruction-count 128))))
     (dapdbg--send-request "disassemble" disassemble-args callback)))
 
@@ -594,7 +595,7 @@ onto the start of the next message."
     (with-current-buffer (dapdbg--get-io-log-buffer)
       (goto-char (point-max))
       (let ((beg (point)))
-        (insert (format "- %s -----------------------------------\n" (if is-request "TX" "RX")))
+        (insert (format "- %s ------------- %s -\n" (if is-request "TX" "RX") (format-time-string "%Y-%m-%d %H:%M:%S")))
         (insert (format "%s\r\n" hdrs))
         (add-face-text-property beg (point)
                                 (if is-request 'dapdbg-request-face 'dapdbg-response-face)))
