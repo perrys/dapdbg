@@ -431,8 +431,7 @@ breakpoint table mappings.")
 
 (defun dapdbg--base-protocol (msg-plist seq)
   "Translate MSG-PLIST (a tree structure expected by the json
-module), return a string which is the header+body format required
-by the DAP protocol
+module), return a plist of `:header' `:body' and `:seq'.
 <https://microsoft.github.io/debug-adapter-protocol/overview#base-protocol>"
   (let* ((json-false :json-false)
          (body (json-encode msg-plist)))

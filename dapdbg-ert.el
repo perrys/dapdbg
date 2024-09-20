@@ -42,25 +42,28 @@ Accept: application/json
        (should (string= "bar" cb-value))
        ))))
 
-(defmacro with-processor (processor-fn)
+(defmacro with-processor (advice-fn form)
   `(progn
     (advice-add #'process-send-string :override ,advice-fn)
-    (funcall processor-fn)
+    ,form
     (advice-remove #'dapdbg--send-request ,advice-fn)))
 
 (ert-deftest can-chain-requests ()
   (let ((proc-fn
-         (lambda (req-str)
-           (let* ((in-msg (dapdbg--parse-message req-str))
-                  (req-seq (gethash "req" in-msg)))
-             (let* ((response (list :request_seq req_seq, :success t)))
-               (dapdbg--handle-server-message nil response))))))
-    (let ((responses nil))
-    (with-processor #'proc-fn
+         (lambda (_ req-str)
+           (pcase-let ((`(:parsed-length ,length :parsed-msg ,parsed-msg)
+                        (dapdbg--parse-message req-str)))
+             (let* ((req-seq (gethash "request_seq" parsed-msg))
+                    (response (list :request_seq req-seq :success t))
+                    (response-str (dapdbg--base-protocol response 0)))
+               (dapdbg--handle-server-message nil response-str))))))
+    (with-processor
+     proc-fn
+     (let ((responses nil))
        (dapdbg--chain-requests
         (list (list :command "threads" :args nil
                     :callback (lambda (_) (setq responses (cons "threads" responses))))
-                                 ))))
-    (should (equal responses '("threads")))))
+              ))
+       (should (equal responses '("threads")))))))
 
                           
