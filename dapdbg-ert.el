@@ -36,7 +36,7 @@ Accept: application/json
 {\"event\":\"xinitialized\",\"seq\":0,\"type\":\"event\"}"))
      (should (equal '(99 210 69) (dapdbg--handle-server-message nil msg))))))
 
-(ert-deftest can-route-callback ()
+(ert-deftest can-route-success-callback ()
   (with-test-setup
    (let* ((cb-value nil)
           (seq-number 345)
@@ -44,6 +44,7 @@ Accept: application/json
      (let ((h-b (dapdbg--base-protocol test-message nil)))
        (dapdbg--register-callback
         seq-number (lambda (msg)
+                     (message "called back: %s" msg)
                      (setq cb-value (gethash "foo" msg))))
        (dapdbg--handle-server-message nil (format "%s\r\n%s" (car h-b) (cdr h-b)))
        (should (string= "bar" cb-value))
