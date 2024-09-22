@@ -2,6 +2,13 @@
 ;;
 ;; run this file with:
 ;; emacs -batch -L . -l ert -l dapdbg-ert.el -f ert-run-tests-batch-and-exit
+;;
+;; add this as a pre-commit hook:
+;;
+;; tests=`find . -name '*-ert.el' -printf ' -l %p'`
+;; if ! emacs -batch -L . -l ert $tests -f ert-run-tests-batch-and-exit ; then
+;;     exit 1
+;; fi
 
 (require 'dapdbg)
 
@@ -33,37 +40,40 @@ Accept: application/json
   (with-test-setup
    (let* ((cb-value nil)
           (seq-number 345)
-          (test-message (list :foo "bar" :type "response" :request_seq seq-number)))
-     (pcase-let ((`(:header ,hdrs :body ,body :seq ,seq) (dapdbg--base-protocol test-message nil)))
+          (test-message (list :foo "bar" :success t :type "response" :request_seq seq-number)))
+     (let ((h-b (dapdbg--base-protocol test-message nil)))
        (dapdbg--register-callback
         seq-number (lambda (msg)
                      (setq cb-value (gethash "foo" msg))))
-       (dapdbg--handle-server-message nil (format "%s\r\n%s" hdrs body))
+       (dapdbg--handle-server-message nil (format "%s\r\n%s" (car h-b) (cdr h-b)))
        (should (string= "bar" cb-value))
        ))))
 
 (defmacro with-processor (advice-fn form)
   `(progn
-    (advice-add #'process-send-string :override ,advice-fn)
-    ,form
-    (advice-remove #'dapdbg--send-request ,advice-fn)))
+     (advice-add #'process-send-string :override ,advice-fn)
+     ,form
+     (advice-remove #'process-send-string ,advice-fn)))
+
+(defun echo-processor (_ req-str)
+  "Simple processor which always returns success and nothing else."
+  (pcase-let ((`(:parsed-length ,length :parsed-msg ,parsed-msg)
+               (dapdbg--parse-message req-str)))
+    (let* ((req-seq (gethash "seq" parsed-msg))
+           (response (list :request_seq req-seq :type "response" :success t))
+           (h-b (dapdbg--base-protocol response 0)))
+      (dapdbg--handle-server-message nil (format "%s\r\n%s" (car h-b)  (cdr h-b))))))
 
 (ert-deftest can-chain-requests ()
-  (let ((proc-fn
-         (lambda (_ req-str)
-           (pcase-let ((`(:parsed-length ,length :parsed-msg ,parsed-msg)
-                        (dapdbg--parse-message req-str)))
-             (let* ((req-seq (gethash "request_seq" parsed-msg))
-                    (response (list :request_seq req-seq :success t))
-                    (response-str (dapdbg--base-protocol response 0)))
-               (dapdbg--handle-server-message nil response-str))))))
-    (with-processor
-     proc-fn
-     (let ((responses nil))
-       (dapdbg--chain-requests
-        (list (list :command "threads" :args nil
-                    :callback (lambda (_) (setq responses (cons "threads" responses))))
-              ))
-       (should (equal responses '("threads")))))))
-
-                          
+  (with-test-setup
+   (with-processor
+    #'echo-processor
+    (let ((responses nil))
+      (dapdbg--chain-requests
+       (list
+        (list :command "foo" :args nil
+              :callback (lambda (_parsed-msg) (setq responses (cons "foo" responses))))
+        (list :command "bar" :args nil
+              :callback (lambda (_parsed-msg) (setq responses (cons "bar" responses))))
+        ))
+      (should (equal responses '("bar" "foo")))))))
