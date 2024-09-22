@@ -87,7 +87,6 @@ information. It includes a keymap for basic debugger control."
   "Major mode for stack trace display"
   :interactive nil
   (let ((addr-width (length (format dapdbg-ui-address-format 0))))
-    (message "width: %d" addr-width)
     (setq tabulated-list-format
           (vector '("Idx" 3 nil :right-align t)
                   `("Prog Counter" ,(if (> addr-width 1) addr-width 16) nil)
@@ -690,6 +689,72 @@ from the instruction cache around PROGRAM-COUNTER."
             (goto-char marker-point)
             (dapdbg-ui-mode--set-instruction-marker (current-buffer)))
         (dapdbg--request-disassembly program-counter nil (apply-partially #'dapdbg-ui--handle-disassembly program-counter))))))
+
+;; ------------------- memory view ---------------------
+
+(defconst dapdbg-ui--memory-view-buffer-name "*Memory*")
+
+(defun dapdbg-ui--get-memory-view-buffer ()
+  (let ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--memory-view-buffer-name)))
+    (when (cdr buf-created)
+      (with-current-buffer (car buf-created)
+        (dapdbg-ui-memory-view-mode)
+        (setq-local buffer-read-only t)
+        (font-lock-mode -1)))
+    (car buf-created)))
+
+(define-derived-mode dapdbg-ui-memory-view-mode tabulated-list-mode "mem"
+  "Major mode for memory view"
+  :interactive nil
+  (setq tabulated-list-format
+        (vector '("Address" 12 nil)
+                '("0011" 4 nil)
+                '("2233" 4 nil)
+                '("4455" 4 nil)
+                '("6677" 4 nil)
+                '("8899" 4 nil)
+                '("aabb" 4 nil)
+                '("ccdd" 4 nil)
+                '("eeff" 4 nil)
+                '("0123456789abcdef" 16 nil)))
+  (tabulated-list-init-header))
+
+(defun dapdbg-ui--render-line (addr bytes)
+  (let ((line (make-vector 10 "")))
+    (aset line 0 (format "%012x" addr))
+    (aset line 1 (concat (format "%02x" (aref bytes 0)) (format "%02x" (aref bytes 1))))
+    (aset line 2 (concat (format "%02x" (aref bytes 2)) (format "%02x" (aref bytes 3))))
+    (aset line 3 (concat (format "%02x" (aref bytes 4)) (format "%02x" (aref bytes 5))))
+    (aset line 4 (concat (format "%02x" (aref bytes 6)) (format "%02x" (aref bytes 7))))
+    (aset line 5 (concat (format "%02x" (aref bytes 8)) (format "%02x" (aref bytes 9))))
+    (aset line 6 (concat (format "%02x" (aref bytes 10)) (format "%02x" (aref bytes 11))))
+    (aset line 7 (concat (format "%02x" (aref bytes 12)) (format "%02x" (aref bytes 13))))
+    (aset line 8 (concat (format "%02x" (aref bytes 14)) (format "%02x" (aref bytes 15))))
+    line))
+
+(defun dapdbg-ui--display-memory (start data)
+  (with-current-buffer (dapdbg-ui--get-memory-view-buffer)
+    (let ((offset 0)
+          (result nil))
+      (while (< offset (length data))
+        (setq result (cons (list (+ start offset) (dapdbg-ui--render-line (+ start offset) (substring data offset (+ offset 16)))) result))
+        (setq offset (+ offset 16)))
+      (setq tabulated-list-entries (nreverse result))
+      (tabulated-list-print))))
+
+(defun dapdbg-ui--refresh-memory-view (start end)
+  (let* ((alignment 16)
+         (mask (lognot (- alignment 1)))
+         (start-aligned (logand mask start))
+         (misalign (mod end alignment))
+         (count  (- end start-aligned)))
+    (when (> misalign 0)
+      (setq count (logand mask (+ count alignment))))
+    (dapdbg--request-memory-dump start-aligned count
+                                 (lambda (parsed-msg)
+                                   (let* ((b64-data (gethash "data" (gethash "body" parsed-msg)))
+                                          (data (base64-decode-string b64-data)))
+                                     (dapdbg-ui--display-memory start-aligned data))))))
 
 ;; ------------------- breakpoints ---------------------
 

@@ -392,7 +392,7 @@ the `StackTraceResponse' parsed message."
   (dapdbg--send-request "variables" (list :variablesReference ref-id) callback))
 
 (defun dapdbg--request-memory-dump (start-address count &optional callback)
-  (dapdbg--send-request "readMemory" (list :memoryReference start-address :count count) callback))
+  (dapdbg--send-request "readMemory" (list :memoryReference (format "0x%x" start-address) :count count) callback))
 
 (defun dapdbg--request-eval-repl (expr &optional callback)
   (dapdbg--send-request "evaluate" (list :expression expr :context "repl") callback))
