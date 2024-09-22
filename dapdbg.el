@@ -63,10 +63,6 @@ version 14 onwards."
   "Additional properties to pass to the launch command."
   :type `(repeat string))
 
-(defcustom dapdbg-page-size 4096
-  "Page size on the machine being debugged, used for fetching disassembly and raw memory."
-  :type 'natnum)
-
 ;; ------------------- initialization and session ---------------------
 
 (cl-defstruct dapdbg-session
@@ -74,10 +70,9 @@ version 14 onwards."
 for keeping track of things like initialization state, request-response callbacks,
 breakpoints and latest thread/stack state when stopped."
   (process nil :read-only t)
+  (type nil :read-only t)
   (callbacks (make-hash-table :test 'equal) :read-only t)
   (source-breakpoints (make-hash-table :test 'equal) :read-only t)
-  (prompt nil)
-  (sends-initialized-event t)
   (buffer "")
   (seq 0)
   (thread-id nil)
@@ -88,25 +83,10 @@ breakpoints and latest thread/stack state when stopped."
 (defvar dapdbg--ssn (make-dapdbg-session)
   "The global session object (only one session is allowed).")
 
-(defconst dapdbg--lldb-plist
-  (list :type "lldb-dap"
-        :command-line-sym 'dapdbg-lldb-command-line
-        :init-commands-sym 'dapdbg-lldb-init-commands
-        :sends-initialized-event nil
-        :prompt "(lldb)"
-        :stop-on-entry-sym :stopOnEntry)
-  "Configuration specific to the LLDB debugger.")
+(defconst dapdbg--lldb-type "lldb-dap")
+(defconst dapdbg--gdb-type "gdb-dap")
 
-(defconst dapdbg--gdb-plist
-  (list :type "gdb-dap"
-        :command-line-sym 'dapdbg-gdb-command-line
-        :init-commands-sym 'dapdbg-gdb-init-commands
-        :sends-initialized-event t
-        :prompt "(gdb)"
-        :stop-on-entry-sym :stopAtBeginningOfMainSubprogram)
-  "Configuration specific to the GDB debugger.")
-
-(defun dapdbg--connect (command-line)
+(defun dapdbg--connect (command-line debugger-type)
   "Start up the debugger in a sub-process, ready for communication."
   (let ((proc (make-process
                :name "dapdbg-session"
@@ -117,7 +97,7 @@ breakpoints and latest thread/stack state when stopped."
                :filter #'dapdbg--handle-server-message
                :noquery t))
         (prev-ssn dapdbg--ssn))
-    (setq dapdbg--ssn (make-dapdbg-session :process proc))
+    (setq dapdbg--ssn (make-dapdbg-session :process proc :type debugger-type))
     (when prev-ssn
       (let ((old-bps (dapdbg-session-source-breakpoints prev-ssn))
             (new-bps (dapdbg-session-source-breakpoints dapdbg--ssn)))
@@ -125,25 +105,27 @@ breakpoints and latest thread/stack state when stopped."
                  old-bps)))
     ))
 
-(defun dapdbg--request-initialize (program program-arguments debugger-plist)
+(defun dapdbg--make-launch-request-args (debugger-type program &optional program-arguments additional-args)
+  "Send a launch request to the debugger. ADDITIONAL-ARGS is a plist
+of extra arguments to the launch request (which is
+debugger-dependent)."
+  (let ((launch-args (list
+                      :name (file-name-nondirectory program)
+                      :type debugger-type
+                      :request "launch"
+                      :program (expand-file-name program))))
+    (when program-arguments
+      (plist-put launch-args :args program-arguments))
+    (setq launch-args (nconc launch-args additional-args))
+    launch-args))
+
+(defun dapdbg--request-initialize (&optional callback)
   "Send an initialize request - this is stage 1 of the
 initialization process. See
 https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
-  (let ((arguments (list
-                    :name (file-name-nondirectory program)
-                    :type (plist-get debugger-plist :type)
-                    :request "launch"
-                    :program (expand-file-name program)
-                    (plist-get debugger-plist :stop-on-entry-sym) t))
-        (init-commands (symbol-value (plist-get debugger-plist :init-commands-sym))))
-    (when program-arguments
-      (plist-put arguments :args program-arguments))
-    (when init-commands
-      (plist-put arguments :initCommands init-commands))
-    (setf (dapdbg-session-launch-args dapdbg--ssn) arguments))
   (let ((args (list
-               :clientID "dapdbg"
-               :clientName "dapdbg"
+               :clientID "emacs"
+               :clientName "Emacs dapdbg"
                :adapterID "dapdbg"
                :pathFormat "path"
                :linesStartAt1 t
@@ -153,78 +135,105 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
                :supportsRunInTerminalRequest nil
                :supportsMemoryReferences t
                :locale "en-us")))
-    (dapdbg--send-request "initialize" args #'dapdbg--handle-initialize-response)))
-
-(defun dapdbg--connect-and-initialize (command-line debugger-plist)
-  "Common start method for all debugger types."
-  (let ((toks (string-split command-line nil t)))
-    (unless (> (length toks) 0)
-      (error "empty command-line"))
-    (when (and dapdbg--ssn (process-live-p (dapdbg-session-process dapdbg--ssn)))
-      (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
-        ("y" (dapdbg-quit))
-        (_ (error "Aborted"))))
-    (dapdbg--connect (symbol-value (plist-get debugger-plist :command-line-sym)))
-    (setf (dapdbg-session-prompt dapdbg--ssn) (plist-get debugger-plist :prompt))
-    (setf (dapdbg-session-sends-initialized-event dapdbg--ssn) (plist-get debugger-plist :sends-initialized-event))
-    (dapdbg--request-initialize (car toks) (cdr toks) debugger-plist)))
-
-(defun dapdbg--start-lldb (command-line)
-  "Start up the LLDB debugger."
-  (dapdbg--connect-and-initialize command-line dapdbg--lldb-plist))
-
-(defun dapdbg--start-gdb (command-line)
-  "Start up the GDB debugger."
-  (dapdbg--connect-and-initialize command-line dapdbg--gdb-plist))
-
-(defun dapdbg--ready-p ()
-  (and dapdbg--ssn
-       (process-live-p (dapdbg-session-process dapdbg--ssn))
-       (dapdbg-session-config-done dapdbg--ssn)))
+    (dapdbg--send-request "initialize" args
+                          (lambda (parsed-msg)
+                            (dapdbg--handle-initialize-response parsed-msg)
+                            (when callback
+                              (funcall callback parsed-msg))))))
 
 (defun dapdbg--handle-initialize-response (msg)
+  "Handle the response to the initialize request, which contains the
+capabilities of the debugger."
   (let ((caps (gethash "body" msg)))
     (dolist (cap '("supportsConditionalBreakpoints" "supportsConfigurationDoneRequest"))
       (unless (gethash cap caps)
         (dapdbg-disconnect)
         (error "Debugger does not have capability \"%s\"" cap)))
-    (setf (dapdbg-session-capabilities dapdbg--ssn) caps))
-  (unless (dapdbg-session-sends-initialized-event dapdbg--ssn)
-    ;; For GDB we just wait for the initialized event, but LLDB seems to require
-    ;; things in an order which doesn't match the spec
-    (dapdbg--set-all-breakpoints #'dapdbg--request-launch-then-configuration-done)))
+    (setf (dapdbg-session-capabilities dapdbg--ssn) caps)))
 
-(defun dapdbg--request-launch-then-configuration-done ()
-  (let ((args (dapdbg-session-launch-args dapdbg--ssn)))
-    (dapdbg--send-request "launch" args
-                          (lambda (_msg)
-                            (dapdbg--send-request "configurationDone" nil #'dapdbg--handle-response-configdone)))))
+(defun dapdbg--start-lldb (command-line)
+  "Start or restart the LLDB debugger, and launch the program from COMMAND-LINE."
+  ;; LLDB only completes initialization after the target is loaded, so needs a fresh session for each launch
+  (when (dapdbg--connected-p)
+    (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
+      ("y" (dapdbg-quit))
+      (_ (error "Aborted"))))
+  (dapdbg--connect dapdbg-lldb-command-line dapdbg--lldb-type)
+  (let* ((toks (string-split command-line nil t))
+         (program (car toks))
+         (program-arguments (cdr toks)))
+    (unless (> (length toks) 0)
+      (error "empty command-line"))
+    (dapdbg--request-initialize
+     (lambda (response)
+       ;; https://github.com/llvm/llvm-project/tree/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap#launching--attaching-configuration
+       (let ((extra-launch-args
+              (list :initCommands dapdbg-lldb-init-commands
+                    :customFrameFormat "${module.file.basename} ${function.name-without-args}"
+                    :stopOnEntry t)))
+         (dapdbg--send-request "launch"
+                               (dapdbg--make-launch-request-args dapdbg--lldb-type program program-arguments extra-launch-args)))))))
 
-(defun dapdbg--request-launch ()
-  (let ((args (dapdbg-session-launch-args dapdbg--ssn)))
-    (dapdbg--send-request "launch" args nil)))
+(defun dapdbg--start-gdb (command-line)
+  "Use GDB to launch and debug the program and arguments given in
+COMMAND-LINE. If a GDB process
+is already running in the current session, it will be re-used."
+  ;; GDB initializes before the target is loaded, so sessions can be re-used.
+  (let ((connected nil))
+    (if (dapdbg--connected-p)
+        (if (equal (dapdbg-session-type dapdbg--ssn) dapdbg--gdb-type)
+            (setq connected t)
+          (pcase (substring (downcase (read-string "Another debugger is running, terminate and replace it (y/n)? " "y")) 0 1)
+            ("y" (dapdbg-quit))
+            (_ (error "Aborted")))))
+    ;; https://sourceware.org/gdb/current/onlinedocs/gdb.html/Debugger-Adapter-Protocol.html
+    (let* ((toks (string-split command-line nil t))
+           (program (car toks))
+           (program-arguments (cdr toks))
+           (extra-launch-args (list :stopAtBeginningOfMainSubprogram t))
+           (launch-args (dapdbg--make-launch-request-args dapdbg--gdb-type program program-arguments extra-launch-args)))
+      (unless (> (length toks) 0)
+        (error "empty command-line"))
+      (if connected
+          (dapdbg--send-request "launch"
+                                (dapdbg--make-launch-request-args dapdbg--lldb-type program program-arguments extra-launch-args))
+        (dapdbg--connect dapdbg-gdb-command-line dapdbg--gdb-type)
+        ;; set the launch to occur after the configurationDone event:
+        (setf (dapdbg-session-launch-args dapdbg--ssn) launch-args)
+        (dapdbg--request-initialize)))))
+
+(defun dapdbg--connected-p ()
+  (and dapdbg--ssn
+       (process-live-p (dapdbg-session-process dapdbg--ssn))))
+
+(defun dapdbg--do-initial-config ()
+  "Chain a set of requests to set breakpoint configuration and so
+on, after which make a configurationDone request."
+  (let ((bp-table (dapdbg-session-source-breakpoints dapdbg--ssn))
+        (chain-args nil))
+    (maphash (lambda (filename source-table)
+               (let* ((bp-args (dapdbg--make-set-breakpoints-args filename source-table))
+                      (chain-elt (list :command "setBreakpoints" :args bp-args
+                                       :callback (apply-partially #'dapdbg--update-breakpoint-table filename))))
+                 (push chain-elt chain-args)))
+             bp-table)
+    ;; TODO: set function breakpoints
+    ;; TODO: set exception breakpoints
+    (push (list :command "configurationDone" :args nil
+                :callback #'dapdbg--handle-response-configdone)
+          chain-args)
+    (dapdbg--chain-requests (nreverse chain-args))))
 
 (defun dapdbg--handle-response-configdone (msg)
+  "When the debugger has finished configuration, if there are launch args pending, send the launch request."
   (setf (dapdbg-session-config-done dapdbg--ssn) t)
-  (when (dapdbg-session-sends-initialized-event dapdbg--ssn)
-    (dapdbg--request-launch)))
-
-(defun dapdbg--request-configuration-done ()
-  "At then end of the initialization sequence, send \"configurationDone\" and do launch afterwards."
-  (dapdbg--send-request "configurationDone" nil #'dapdbg--handle-response-configdone))
+  (let ((args (dapdbg-session-launch-args dapdbg--ssn)))
+    (when args
+      (dapdbg--send-request "launch" args))))
 
 (defun dapdbg--handle-event-initialized (parsed-msg)
-  "Once the intialized event is recieved - set any breakpoints, then
-proceed with the initialization sequence."
-  (when (dapdbg-session-sends-initialized-event dapdbg--ssn)
-    (dapdbg--set-all-breakpoints #'dapdbg--request-configuration-done)))
-
-(defun dapdbg--initialized-p ()
-  "Check that the debugger is alive and has initialized. See
-https://microsoft.github.io/debug-adapter-protocol/specification#Requests_Initialize."
-  (and dapdbg--ssn
-       (process-live-p (dapdbg-session-process dapdbg--ssn))
-       (dapdbg-session-capabilities dapdbg--ssn)))
+  "Once the intialized event is recieved - set exception behaviour and any breakpoints."
+  (dapdbg--do-initial-config))
 
 (defun dapdbg-quit ()
   "Shut down and disconnect from the currently running DAP server (if any)."
@@ -283,39 +292,28 @@ current buffer."
       (if existing-bp
           (remhash linenumber source-table)
         (puthash linenumber linenumber source-table)))
-    (if (dapdbg--ready-p)
+    (if (dapdbg--connected-p)
         (dapdbg--request-set-breakpoints-for-file filename)
       (let ((source-table (dapdbg--get-or-create-source-table filename))
             (updated-table (make-hash-table :test 'equal)))
         (puthash filename source-table updated-table)
         (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table)))))
 
+(defun dapdbg--make-set-breakpoints-args (filename source-table)
+  "Return the arguments for a setBreakpoints request for the source FILENAME."
+  (list :source (list :name (file-name-nondirectory filename) :path filename)
+        :breakpoints (vconcat (mapcar (lambda (n) (list :line n)) (hash-table-keys source-table)))))
+
 (defun dapdbg--request-set-breakpoints-for-file (filename &optional callback)
   "Request the debugger to update the breakpoints for the source FILENAME."
   (let ((source-table (dapdbg--get-or-create-source-table filename)))
     (dapdbg--send-request
      "setBreakpoints"
-     (list :source (list :name (file-name-nondirectory filename) :path filename)
-           :breakpoints (vconcat (mapcar (lambda (n) (list :line n)) (hash-table-keys source-table))))
-     (lambda (parsed-msg)
-       (dapdbg--update-breakpoint-table filename parsed-msg)
+     (dapdbg--make-set-breakpoints-args filename source-table)
+     (lambda (response)
+       (dapdbg--update-breakpoint-table filename response)
        (if callback
-           (funcall callback parsed-msg))))))
-
-(defun dapdbg--set-breakpoint-in-chain (remaining-filenames final-callback _parsed-msg)
-  (if remaining-filenames
-      (dapdbg--request-set-breakpoints-for-file
-       (car remaining-filenames)
-       (apply-partially #'dapdbg--set-breakpoint-in-chain (cdr remaining-filenames) final-callback))
-    (when final-callback ; no filenames remaining
-      (funcall final-callback))))
-
-(defun dapdbg--set-all-breakpoints (&optional final-callback)
-  "Chain a set of requests to set source breakpoints for all
-filenames, then call any final callback."
-  (let* ((bp-table (dapdbg-session-source-breakpoints dapdbg--ssn))
-         (filenames (hash-table-keys bp-table)))
-    (dapdbg--set-breakpoint-in-chain filenames final-callback nil)))
+           (funcall callback response))))))
 
 (defun dapdbg--update-breakpoint-table (filename bp-response)
   (unless (equal "setBreakpoints" (gethash "command" bp-response))
@@ -445,17 +443,16 @@ breakpoint table mappings.")
 
 (defun dapdbg--base-protocol (msg-plist seq)
   "Translate MSG-PLIST (a tree structure expected by the json
-module), return a string which is the header+body format required
-by the DAP protocol
+module), return a cons pair of (header . body)
 <https://microsoft.github.io/debug-adapter-protocol/overview#base-protocol>"
   (let* ((json-false :json-false)
          (body (json-encode msg-plist)))
-    (list
-     :header (format "Content-Length: %d\r\n" (string-bytes body))
-     :body body
-     :seq seq)))
+    (cons (format "Content-Length: %d\r\n" (string-bytes body)) body)))
 
 (defun dapdbg--create-request (command &optional args)
+  "Create a request for COMMAND with optional ARGS supplied as a
+tree structure of plists. Returns a plist with properties
+`:header' `:body' and `:seq'."
   (let* ((seq (dapdbg--seq-and-inc))
          (request-plist (list
                          :command command
@@ -463,17 +460,39 @@ by the DAP protocol
                          :type "request")))
     (when args
       (plist-put request-plist :arguments args))
-    (dapdbg--base-protocol request-plist seq)))
+    (let ((hdr-body (dapdbg--base-protocol request-plist seq)))
+      (list :header (car hdr-body) :body (cdr hdr-body) :seq seq))))
 
 (defun dapdbg--register-callback (seq callback)
   (puthash seq callback (dapdbg-session-callbacks dapdbg--ssn)))
 
 (defun dapdbg--send-request (command &optional args callback)
+  "Send a requests of type COMMAND to the debugger, ARGS is the set
+of arguments as a plist."
   (pcase-let ((`(:header ,hdrs :body ,body :seq ,seq) (dapdbg--create-request command args)))
     (dapdbg--log-io-message hdrs body t)
     (if callback
         (dapdbg--register-callback seq callback))
     (process-send-string (dapdbg-session-process dapdbg--ssn) (format "%s\r\n%s" hdrs body))))
+
+(defun dapdbg--chain-requests (requests)
+  "Excecute a set of requests in sequence. Each element of REQUESTS
+is a plist with properties `:command' (request type),
+`:args' (arguments to the request) and `:callback' (function to
+call with the result), invoking `dapdbg--send-request' each time."
+  (pcase-let ((`(:command ,req-type :args ,req-args :callback ,callback) (car requests)))
+    (let* ((remaining (cdr requests))
+           (handler (lambda (parsed-msg)
+                      (when callback
+                        (funcall callback parsed-msg))
+                      (when remaining
+                        (dapdbg--chain-requests remaining)))))
+      (dapdbg--send-request req-type req-args handler))))
+
+(defcustom dapdbg-io-log-flag nil
+  "Enables output of request & response messages to/from the DAP
+   server (only useful for debugging this package)"
+  :type 'boolean)
 
 (defun dapdbg--handle-event (parsed-msg)
   (pcase (gethash "event" parsed-msg)
@@ -488,7 +507,12 @@ by the DAP protocol
     ("continued" (run-hook-with-args 'dapdbg--continued-callback-list parsed-msg))
     ("output" (run-hook-with-args 'dapdbg--output-callback-list parsed-msg))
     ("thread" (run-hook-with-args 'dapdbg--thread-callback-list parsed-msg))
-    (`,an-event (message "event: %s" an-event))))
+    ("process" (let ((body (gethash "body" parsed-msg)))
+                 (message "%sed %s, pid: %d"
+                          (gethash "startMethod" body)
+                          (gethash "name" body)
+                          (gethash "systemProcessId" body))))
+    (`,an-event (message "unhandled event: %s" an-event))))
 
 (defun dapdbg--handle-response (parsed-msg)
   (if (not (gethash "success" parsed-msg))
@@ -518,7 +542,7 @@ by the DAP protocol
             (setf (dapdbg-session-buffer dapdbg--ssn) remaining)
             (throw 'incomplete-msg nil))))
       (setf (dapdbg-session-buffer dapdbg--ssn) "")
-      (reverse chunks))))
+      (nreverse chunks))))
 
 (defun dapdbg--parse-json (str)
   (let* ((json-array-type 'list)
@@ -560,11 +584,6 @@ onto the start of the next message."
            :parsed-msg (dapdbg--parse-json (substring body 0 content-length))))))))
 
 ;; ------------------- internal tools ---------------------
-
-(defcustom dapdbg-io-log-flag nil
-  "Enables output of request & response messages to/from the DAP
-   server (only useful for debugging this package)"
-  :type 'boolean)
 
 (defface dapdbg-request-face
   '((t :inherit (warning)))
