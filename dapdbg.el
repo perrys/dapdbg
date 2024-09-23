@@ -527,7 +527,7 @@ call with the result), invoking `dapdbg--send-request' each time."
 (defun dapdbg--handle-server-message (_process msg)
   (catch 'incomplete-msg
     (let ((remaining (concat (dapdbg-session-buffer dapdbg--ssn) msg))
-          (chunks (list)))
+          (chunk-lengths nil))
       (while (not (string-empty-p remaining))
         (pcase-let ((`(:parsed-length ,length :parsed-msg ,parsed-msg) (dapdbg--parse-message remaining)))
           (if parsed-msg
@@ -536,13 +536,13 @@ call with the result), invoking `dapdbg--send-request' each time."
                   ("event" (dapdbg--handle-event parsed-msg))
                   ("response" (dapdbg--handle-response parsed-msg))
                   (`,something (message "unrecognized message type %s" something)))
-                (add-to-list 'chunks length)
+                (push length chunk-lengths)
                 (setq remaining (substring remaining length)))
             ;; message is incomplete, push it back to the buffer and return
             (setf (dapdbg-session-buffer dapdbg--ssn) remaining)
             (throw 'incomplete-msg nil))))
       (setf (dapdbg-session-buffer dapdbg--ssn) "")
-      (nreverse chunks))))
+      (nreverse chunk-lengths))))
 
 (defun dapdbg--parse-json (str)
   (let* ((json-array-type 'list)

@@ -27,12 +27,12 @@ Accept: application/json
 
 (ert-deftest can-parse-compound-msg ()
   (with-test-setup
-   (let ((msg "Content-Length: 77
-
-{\"command\":\"launch\",\"request_seq\":3,\"seq\":0,\"success\":true,\"type\":\"response\"}Content-Length: 187
-
-{\"body\":{\"isLocalProcess\":true,\"name\":\"/home/stu/dev/advent_of_code/2022/rust/target/debug/day10\",\"startMethod\":\"launch\",\"systemProcessId\":34279},\"event\":\"process\",\"seq\":0,\"type\":\"event\"}Content-Length: 47
-
+   (let ((msg "Content-Length: 77\r
+\r
+{\"command\":\"launch\",\"request_seq\":3,\"seq\":0,\"success\":true,\"type\":\"response\"}Content-Length: 187\r
+\r
+{\"body\":{\"isLocalProcess\":true,\"name\":\"/home/stu/dev/advent_of_code/2022/rust/target/debug/day10\",\"startMethod\":\"launch\",\"systemProcessId\":34279},\"event\":\"process\",\"seq\":0,\"type\":\"event\"}Content-Length: 47\r
+\r
 {\"event\":\"xinitialized\",\"seq\":0,\"type\":\"event\"}"))
      (should (equal '(99 210 69) (dapdbg--handle-server-message nil msg))))))
 
@@ -44,7 +44,6 @@ Accept: application/json
      (let ((h-b (dapdbg--base-protocol test-message nil)))
        (dapdbg--register-callback
         seq-number (lambda (msg)
-                     (message "called back: %s" msg)
                      (setq cb-value (gethash "foo" msg))))
        (dapdbg--handle-server-message nil (format "%s\r\n%s" (car h-b) (cdr h-b)))
        (should (string= "bar" cb-value))
