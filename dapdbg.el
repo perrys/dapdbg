@@ -37,7 +37,7 @@
 
 ;; ------------------- custom variables ---------------------
 
-(defcustom dapdbg-lldb-command-line '("lldb-dap-18")
+(defcustom dapdbg-lldb-command-line '("lldb-dap")
   "Command-line to invoke the lldb debugger process.
 
 The LLDB debugger ships with a separate binary for the DAP server
@@ -45,23 +45,25 @@ The LLDB debugger ships with a separate binary for the DAP server
 called 'lldb-dap' since version 18."
   :type `(repeat string))
 
-(defcustom dapdbg-gdb-command-line '("rust-gdb" "-i" "dap")
+(defcustom dapdbg-gdb-command-line '("gdb" "-i" "dap")
   "Command-line to invoke the gdb debugger process.
 
 The GDB debugger implements the DAP interface with the
 command-line flags '-i dap'. Note that GDB supports DAP from
 version 14 onwards."
-  :type `(repeat string))
+  :type '(repeat string))
 
-(defcustom dapdbg-lldb-init-commands
-  '("command script import ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/etc/lldb_lookup.py"
-    "command source ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/etc/lldb_commands")
+(defcustom dapdbg-lldb-init-commands nil
   "Additional properties to pass to the launch command."
-  :type `(repeat string))
+  :type '(repeat string))
+
+(defcustom dapdbg-lldb-source-mappings nil
+  "Source mappings for LLDB, each element in the alist is source->destination."
+  :type '(alist :key-type string :value-type string))
 
 (defcustom dapdbg-gdb-init-commands nil
   "Additional properties to pass to the launch command."
-  :type `(repeat string))
+  :type '(repeat string))
 
 ;; ------------------- initialization and session ---------------------
 
@@ -169,8 +171,11 @@ capabilities of the debugger."
        ;; https://github.com/llvm/llvm-project/tree/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap#launching--attaching-configuration
        (let ((extra-launch-args
               (list :initCommands dapdbg-lldb-init-commands
-                    :customFrameFormat "${module.file.basename} ${function.name-without-args}"
                     :stopOnEntry t)))
+         (let ((srcmap (apply 'vector (mapcar (lambda (mapping) (vector (car mapping) (cdr mapping)))
+                                              dapdbg-lldb-source-mappings))))
+           (unless (seq-empty-p srcmap)
+             (plist-put extra-launch-args :sourceMap srcmap)))
          (dapdbg--send-request "launch"
                                (dapdbg--make-launch-request-args dapdbg--lldb-type program program-arguments extra-launch-args)))))))
 
@@ -327,15 +332,18 @@ current buffer."
     (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table)))
 
 (defun dapdbg--update-breakpoint-table-single-bp (bp-details &optional remove)
-  (let* ((filename (gethash "path" (gethash "source" bp-details)))
-         (linenumber (gethash "line" bp-details))
-         (source-table (dapdbg--get-or-create-source-table filename))
-         (updated-table (make-hash-table :test 'equal)))
-    (puthash filename source-table updated-table)
-    (if remove
-        (remhash linenumber  source-table)
-      (puthash linenumber bp-details source-table))
-    (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table)))
+  "Update the breakpoint table for this session, usually in response
+to a breakpoint event from the debugger."
+  (if-let ((source (gethash "source" bp-details)))
+      (let* ((filename (gethash "path" source))
+             (linenumber (gethash "line" bp-details))
+             (source-table (dapdbg--get-or-create-source-table filename))
+             (updated-table (make-hash-table :test 'equal)))
+        (puthash filename source-table updated-table)
+        (if remove
+            (remhash linenumber  source-table)
+          (puthash linenumber bp-details source-table))
+        (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table))))
 
 ;; ------------------- disassembly ---------------------
 
@@ -605,7 +613,9 @@ onto the start of the next message."
   (let ((buf-created (dapdbg--get-or-create-buffer "*dapdbg IO*")))
     (when (cdr buf-created)
       (with-current-buffer (car buf-created)
-        (js-json-mode)
+        (if (symbol-function 'js-json-mode)
+            (js-json-mode)
+          (js-mode))
         (font-lock-mode -1)))
     (car buf-created)))
 

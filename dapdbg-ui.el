@@ -233,8 +233,10 @@ accounting for existing breakpoint markers."
 
 ;; ------------------- REPL and I/O ---------------------
 
+(defconst dapdbg-ui--interaction-buffer-name "*Debugger REPL*")
+
 (defun dapdbg-ui--output (data &optional category)
-  (let* ((buf-created (dapdbg--get-or-create-buffer "*Input/Output*"))
+  (let* ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--interaction-buffer-name))
          (buf (car buf-created)))
     (when (cdr buf-created)
       (with-current-buffer buf
@@ -409,7 +411,7 @@ reloading."
          (downcase (substring haystack 0 (length needle)))))
 
 (defun dapdbg-ui--escape (str)
-  (mapconcat (lambda (c) (if (eql c ?\n) "\\n" (list c))) str))
+  (mapconcat (lambda (c) (if (eql c ?\n) "\\n" (list c))) str ""))
 
 (defun dapdbg-ui--make-variables-tabulated-list-r (id var-table depth target-list)
   "Construct a list for display by recursing through the tree
@@ -805,22 +807,22 @@ from the instruction cache around PROGRAM-COUNTER."
   (interactive)
   (add-to-list
    'display-buffer-alist
-   '((major-mode . dapdbg-ui-output-mode)
+   `(,dapdbg-ui--interaction-buffer-name
      (display-buffer-in-side-window)
-     (side . bottom)
-     (slot . 1)))
+     (side . left)
+     (slot . 0)))
+  (add-to-list
+   'display-buffer-alist
+   `(,dapdbg-ui--call-stack-buffer-name
+     (display-buffer-in-side-window)
+     (side . left)
+     (slot . 2)))
   (add-to-list
    'display-buffer-alist
    `(,dapdbg-ui--disassembly-buffer-name
      (display-buffer-in-side-window)
      (side . bottom)
      (slot . 2)))
-  (add-to-list
-   'display-buffer-alist
-   '((major-mode . dapdbg-ui-call-stack-mode)
-     (display-buffer-in-side-window)
-     (side . left)
-     (slot . 1)))
   (add-to-list
    'display-buffer-alist
    `(,dapdbg-ui--variables-buffer-name
@@ -833,12 +835,6 @@ from the instruction cache around PROGRAM-COUNTER."
      (display-buffer-in-side-window)
      (side . right)
      (slot . 2)))
-  (add-to-list
-   'display-buffer-alist
-   '((major-mode . dapdbg-ui-globals-mode)
-     (display-buffer-in-side-window)
-     (side . right)
-     (slot . 3)))
   )
 
 (provide 'dapdbg-ui)
