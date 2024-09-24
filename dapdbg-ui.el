@@ -81,7 +81,7 @@ information. It includes a keymap for basic debugger control."
 
 (defvar-keymap dapdbg-ui-variables-mode-map
   :doc "Local keymap for `dapdbg-ui-variables-mode' buffers."
-  :parent tabulated-list-mode-map
+  :parent (make-composed-keymap dapdbg-ui-mode-map tabulated-list-mode-map)
   "TAB" #'dapdbg-ui--toggle-expand-variable)
 
 (define-derived-mode dapdbg-ui-variables-mode tabulated-list-mode "vars"
@@ -95,7 +95,7 @@ information. It includes a keymap for basic debugger control."
 
 (defvar-keymap dapdbg-ui-call-stack-mode-map
   :doc "Local keymap for `STrace' buffers."
-  :parent tabulated-list-mode-map
+  :parent (make-composed-keymap dapdbg-ui-mode-map tabulated-list-mode-map)
   "RET" #'dapdbg-ui--select-stack-frame)
 
 (define-derived-mode dapdbg-ui-call-stack-mode tabulated-list-mode "stack"
@@ -110,6 +110,7 @@ information. It includes a keymap for basic debugger control."
 
 (defvar-keymap dapdbg-ui-output-mode-map
   :doc "Local keymap for `dapdbg I/O' buffers."
+  :parent dapdbg-ui-mode-map
   "M-p" #'dapdbg-ui-previous-input
   "RET" #'dapdbg-ui-send-input)
 
@@ -121,6 +122,14 @@ information. It includes a keymap for basic debugger control."
               dapdbg-ui--input-ring (make-ring dapdbg-ui-input-ring-size))
   (insert (concat dapdbg-ui--io-prompt " "))
   (setq-local dapdbg-ui--input-mark (point-max)))
+
+(defvar-keymap dapdbg-ui-asm-mode-map
+  :doc "Local keymap for disassembly buffers."
+  :parent dapdbg-ui-mode-map)
+
+(define-derived-mode dapdbg-ui-asm-mode asm-mode "disassembly"
+  "Major mode for the debugger's disassembly buffer"
+  :interactive nil)
 
 ;; ------------------- commands ---------------------
 
@@ -601,7 +610,7 @@ PARENT-ID provided in CHILD-LIST."
   (let ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--disassembly-buffer-name)))
     (when (cdr buf-created) ; freshly-opened
       (with-current-buffer (car buf-created)
-        (asm-mode)
+        (dapdbg-ui-asm-mode)
         (dapdbg-ui--set-left-margin 2)
         (font-lock-mode -1)
         ;; do this after setting the major mode
