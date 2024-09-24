@@ -37,12 +37,17 @@
 
 ;; ------------------- custom variables ---------------------
 
+(defgroup dapdbg nil
+  "DAP Debugger, and its User Interface."
+  :group 'tools)
+
 (defcustom dapdbg-lldb-command-line '("lldb-dap")
   "Command-line to invoke the lldb debugger process.
 
 The LLDB debugger ships with a separate binary for the DAP server
 - on older versions this is called 'lldb-vscode', and it is
 called 'lldb-dap' since version 18."
+  :group 'dapdbg
   :type `(repeat string))
 
 (defcustom dapdbg-gdb-command-line '("gdb" "-i" "dap")
@@ -51,18 +56,22 @@ called 'lldb-dap' since version 18."
 The GDB debugger implements the DAP interface with the
 command-line flags '-i dap'. Note that GDB supports DAP from
 version 14 onwards."
+  :group 'dapdbg
   :type '(repeat string))
 
 (defcustom dapdbg-lldb-init-commands nil
   "Additional properties to pass to the launch command."
+  :group 'dapdbg
   :type '(repeat string))
 
 (defcustom dapdbg-lldb-source-mappings nil
   "Source mappings for LLDB, each element in the alist is source->destination."
+  :group 'dapdbg
   :type '(alist :key-type string :value-type string))
 
 (defcustom dapdbg-gdb-init-commands nil
   "Additional properties to pass to the launch command."
+  :group 'dapdbg
   :type '(repeat string))
 
 ;; ------------------- initialization and session ---------------------

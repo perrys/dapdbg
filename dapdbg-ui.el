@@ -7,20 +7,24 @@
 
 (defface dapdbg-ui-marker-face
   '((t :inherit (secondary-selection)))
-  "Face for current line marker")
+  "Face for current line marker"
+  :group 'dapdbg)
 
 (defface dapdbg-ui-arrow-face
   '((t :inherit (warning)))
-  "Face for current line marker arrow")
+  "Face for current line marker arrow"
+  :group 'dapdbg)
 
 (defface dapdbg-ui-breakpoint-face
   '((t :inherit (error)))
-  "Face for breakpoint markers")
+  "Face for breakpoint markers"
+  :group 'dapdbg)
 
 ;; ------------------- custom variables ---------------------
 
 (defcustom dapdbg-ui-input-ring-size 64
   "Length of command-history for the I/O buffer"
+  :group 'dapdbg
   :type 'natnum)
 
 (defcustom dapdbg-ui-address-format "%013x"
@@ -29,7 +33,18 @@
 The default is 13 hex characters (zero-padded), which is enough
 to display 52-bit addresses. You may need to widen this for some
 architectures."
+  :group 'dapdbg
   :type 'natnum)
+
+(defcustom dapdbg-ui-show-globals-flag t
+  "Show global variables in the variables buffer.
+
+Some debugged programs report a large number of global variables
+which are not interesting from the point of view of the
+debuggging process. This flag can be used to supress the fetch
+and display of those."
+  :group 'dapdbg
+  :type 'boolean)
 
 ;; ------------------- modes ---------------------
 
@@ -570,6 +585,7 @@ PARENT-ID provided in CHILD-LIST."
         (let ((processor
                (pcase (downcase kind)
                  ("registers" #'dapdbg-ui--registers-update)
+                 ("globals" (if dapdbg-ui-show-globals-flag #'dapdbg-ui--variables-update nil))
                  (_ #'dapdbg-ui--variables-update))))
           (when processor
             (let ((handler (lambda (parsed-msg1)
