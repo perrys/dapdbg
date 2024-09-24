@@ -438,6 +438,12 @@ breakpoint table mappings.")
 (defvar dapdbg--breakpoint-callback-list nil
   "Functions to call when the debugger sends an 'breakpoint' event.")
 
+(defvar dapdbg--exited-callback-list nil
+  "Functions to call when the debugger sends an 'exited' event.")
+
+(defvar dapdbg--terminated-callback-list nil
+  "Functions to call when the debugger sends an 'terminated' event.")
+
 (defun dapdbg--handle-event-stopped (msg)
   (let ((tid (gethash "threadId" (gethash "body" msg))))
     (setf (dapdbg-session-thread-id dapdbg--ssn) tid)))
@@ -521,15 +527,15 @@ call with the result), invoking `dapdbg--send-request' each time."
     ("breakpoint"
      (dapdbg--handle-event-breakpoint parsed-msg)
      (run-hook-with-args 'dapdbg--breakpoint-callback-list parsed-msg))
-    ("continued" (run-hook-with-args 'dapdbg--continued-callback-list parsed-msg))
-    ("output" (run-hook-with-args 'dapdbg--output-callback-list parsed-msg))
-    ("thread" (run-hook-with-args 'dapdbg--thread-callback-list parsed-msg))
     ("process" (let ((body (gethash "body" parsed-msg)))
                  (message "%sed %s, pid: %d"
                           (gethash "startMethod" body)
                           (gethash "name" body)
                           (gethash "systemProcessId" body))))
-    (`,an-event (message "unhandled event: %s" an-event))))
+    (`,an-event
+     (if-let ((sym (intern-soft (format "dapdbg--%s-callback-list" an-event))))
+         (run-hook-with-args sym parsed-msg)
+       (message "unhandled event: %s" an-event)))))
 
 (defun dapdbg--handle-response (parsed-msg)
   (if (not (gethash "success" parsed-msg))
