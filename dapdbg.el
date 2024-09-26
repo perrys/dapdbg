@@ -144,8 +144,11 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
                :columnsStartAt1 t
                :supportsVariableType t
                :supportsVariablePaging t
-               :supportsRunInTerminalRequest nil
+               :supportsRunInTerminalRequest t
                :supportsMemoryReferences t
+               :supportsProgressReporting t
+               :supportsInvalidatedEvent t
+               :supportsMemoryEvent t
                :locale "en-us")))
     (dapdbg--send-request "initialize" args
                           (lambda (parsed-msg)
@@ -474,6 +477,9 @@ breakpoint table mappings.")
 (dapdbg--make-event-callback-list "module")
 (dapdbg--make-event-callback-list "output")
 (dapdbg--make-event-callback-list "process")
+(dapdbg--make-event-callback-list "progressStart")
+(dapdbg--make-event-callback-list "progressUpdate")
+(dapdbg--make-event-callback-list "progressEnd")
 (dapdbg--make-event-callback-list "stopped")
 (dapdbg--make-event-callback-list "thread")
 (dapdbg--make-event-callback-list "terminated")

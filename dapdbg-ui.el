@@ -113,16 +113,12 @@ information. It includes a keymap for basic debugger control."
   :doc "Local keymap for `dapdbg I/O' buffers."
   :parent dapdbg-ui-mode-map
   "M-p" #'dapdbg-ui-previous-input
+  "M-n" #'dapdbg-ui-next-input
   "RET" #'dapdbg-ui-send-input)
 
 (define-derived-mode dapdbg-ui-output-mode fundamental-mode "dbgIO"
   "Major mode for the debugger REPL and process output"
-  :interactive nil
-  (setq-local dapdbg-ui--output-mark (point-min)
-              dapdbg-ui--io-prompt (propertize "(gdb)" 'read-only t 'face 'comint-highlight-prompt)
-              dapdbg-ui--input-ring (make-ring dapdbg-ui-input-ring-size))
-  (insert (concat dapdbg-ui--io-prompt " "))
-  (setq-local dapdbg-ui--input-mark (point-max)))
+  :interactive nil)
 
 (defvar-keymap dapdbg-ui-asm-mode-map
   :doc "Local keymap for disassembly buffers."
@@ -266,48 +262,104 @@ accounting for existing breakpoint markers."
 
 (defconst dapdbg-ui--interaction-buffer-name "*Debugger REPL*")
 
-(defun dapdbg-ui--output (data &optional category)
+(defun dapdbg-ui--get-repl-buffer ()
+  "Get the main buffer used to interact with the debugger."
   (let* ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--interaction-buffer-name))
          (buf (car buf-created)))
     (when (cdr buf-created)
       (with-current-buffer buf
         (dapdbg-ui-output-mode)
-        (font-lock-mode -1)))
-    (with-current-buffer buf
-      (let ((props (list 'read-only t)))
-        (pcase category
-          ("stderr" (plist-put props 'face 'font-lock-warning-face))
-          ('event (plist-put props 'face 'font-lock-comment-face)))
-        (add-text-properties 0 (length data) props data)
-        (goto-char dapdbg-ui--output-mark)
-        (let ((inhibit-read-only t)) (insert data))
-        (setq-local dapdbg-ui--output-mark (+ dapdbg-ui--output-mark (length data))
-                    dapdbg-ui--input-mark (+ dapdbg-ui--input-mark (length data)))
-        (goto-char (point-max))))
-    (display-buffer buf)))
+        (setq-local dapdbg-ui--progress-table (make-hash-table :test 'eql)
+                    dapdbg-ui--prompt-olay (make-overlay (point-max) (point-max))
+                    dapdbg-ui--input-ring-index nil
+                    dapdbg-ui--incomplete-input nil
+                    dapdbg-ui--input-ring (make-ring dapdbg-ui-input-ring-size))
+        (font-lock-mode -1))
+      (dapdbg-ui--set-repl-prompt))
+    buf))
+
+(defun dapdbg-ui--set-repl-prompt ()
+  "Set up the repl prompt using the type of the current session debugger."
+  (with-current-buffer (dapdbg-ui--get-repl-buffer)
+    (overlay-put dapdbg-ui--prompt-olay
+                 'before-string (propertize (format "(%s) " (dapdbg-session-type dapdbg--ssn))
+                                            'face 'comint-highlight-prompt))))
+
+(defun dapdbg-ui--output (data &optional category)
+  "Output the given data into the repl buffer just before the prompt."
+  (when (not (string-empty-p data))
+    (let ((buf (dapdbg-ui--get-repl-buffer)))
+      (with-current-buffer buf
+        (let ((props (list 'read-only t)))
+          (pcase category
+            ("stderr" (plist-put props 'face 'font-lock-warning-face))
+            ('event (plist-put props 'face 'font-lock-comment-face)))
+          (put-text-property (1- (length data)) (1- (length data)) 'rear-nonsticky '(read-only) data)
+          (add-text-properties 0 (1- (length data)) props data)
+          (goto-char (overlay-start dapdbg-ui--prompt-olay))
+          (let ((inhibit-read-only t)) (insert-before-markers data))
+          (goto-char (point-max))))
+      (display-buffer buf))))
+
+(defun dapdbg-ui--progress (id percent &optional message)
+  "Output a progress indicator into the current buffer. The first
+progess update for ID is inserted into the buffer just before the
+prompt, and subsequent updates are written to the same line."
+  (let ((buf (dapdbg-ui--get-repl-buffer)))
+    (with-current-buffer
+        (let ((progress-record (gethash id dapdbg-ui--progress-table))
+              (output-mark (overlay-start dapdbg-ui--prompt-olay))
+              (props (list 'read-only t 'rear-nonsticky t 'face 'font-lock-comment-face)))
+          (unless progress-record
+            (setq progress-record (puthash id (cons (output-mark) message) dapdbg-ui--progress-table)))
+          (if message
+              (setcdr progress-record message)
+            (setq message (cdr progress-record)))
+          (goto-char (car progress-record))
+          (delete-region (point) (line-end-position))
+          (let ((text (format "# Progress: %s %d%%\n" message percent)))
+            (add-text-properties 0 (length text) props text)
+            (insert-before-markers text))))))
 
 (defun dapdbg-ui-previous-input (arg)
   (interactive "*p")
   (if (ring-empty-p dapdbg-ui--input-ring)
       (message "no previous command")
-    (unless dapdbg-ui--input-ring-index
-      (let ((current-input (buffer-substring-no-properties dapdbg-ui--input-mark (point-max))))
-        (unless (string-empty-p current-input)
-          (setq-local dapdbg-ui--incomplete-input current-input)))
-      (setq-local dapdbg-ui--input-ring-index 1))
-    (let ((prev-input (ring-ref dapdbg-ui--input-ring dapdbg-ui--input-ring-index)))
-      (cl-incf dapdbg-ui--input-ring-index)
-      (delete-region dapdbg-ui--input-mark (point-max))
-      (goto-char dapdbg-ui--input-mark)
-      (insert prev-input))))
+    (let ((input-mark (overlay-end dapdbg-ui--prompt-olay)))
+      (unless dapdbg-ui--input-ring-index
+        (let ((current-input (buffer-substring-no-properties input-mark (point-max))))
+          (unless (string-empty-p current-input)
+            (setq-local dapdbg-ui--incomplete-input current-input)))
+        (setq-local dapdbg-ui--input-ring-index 0))
+      (let ((prev-input (ring-ref dapdbg-ui--input-ring dapdbg-ui--input-ring-index)))
+        (cl-incf dapdbg-ui--input-ring-index)
+        (goto-char input-mark)
+        (delete-region (point) (point-max))
+        (insert prev-input)))))
+
+(defun dapdbg-ui-next-input (arg)
+  (interactive "*p")
+  (when dapdbg-ui--input-ring-index
+    (let ((next-input
+           (if (eql dapdbg-ui--input-ring-index 0)
+               (progn
+                 (setq dapdbg-ui--input-ring-index nil)
+                 (or dapdbg-ui--incomplete-input ""))
+             (cl-decf dapdbg-ui--input-ring-index)
+             (ring-ref dapdbg-ui--input-ring dapdbg-ui--input-ring-index))))
+      (goto-char (overlay-end dapdbg-ui--prompt-olay))
+      (delete-region (point) (point-max))
+      (insert next-input))))
 
 (defun dapdbg-ui-send-input ()
   (interactive)
-  (let ((input (buffer-substring-no-properties dapdbg-ui--input-mark (point-max))))
-    (delete-region dapdbg-ui--input-mark (point-max))
-    (ring-insert dapdbg-ui--input-ring input)
-    (setq-local dapdbg-ui--input-ring-index nil)
-    (dapdbg-ui--eval-repl input)))
+  (let* ((input-mark (overlay-end dapdbg-ui--prompt-olay))
+         (input (buffer-substring-no-properties input-mark (point-max))))
+    (when (not (string-empty-p (string-trim input)))
+      (delete-region input-mark (point-max))
+      (ring-insert dapdbg-ui--input-ring input)
+      (setq-local dapdbg-ui--input-ring-index nil)
+      (dapdbg-ui--eval-repl input))))
 
 ;; ------------------- call-stack ---------------------
 
@@ -343,7 +395,7 @@ accounting for existing breakpoint markers."
                    (setq pc (dapdbg--parse-address pc)))
                  (list id (vector
                            (propertize (format "%d" idx) 'face 'font-lock-variable-name-face)
-                           (propertize (if pc (dapdbg-ui--addr pc) "<unknown>") 'face 'font-lock-number-face)
+                           (if pc (dapdbg-ui--addr pc) "<unknown>")
                            (propertize name 'face 'font-lock-function-name-face)))))
              call-stack))
       (tabulated-list-print)
@@ -815,13 +867,27 @@ from the instruction cache around PROGRAM-COUNTER."
   nil) ;; TODO
 
 (defun dapdbg-ui--handle-process-event (parsed-msg)
+  (dapdbg-ui--set-repl-prompt)
   (let ((body (gethash "body" parsed-msg)))
-    (dapdbg-ui--output (format "# %sed %s, pid: %d\n"
+    (dapdbg-ui--output (format "# Event: %s %s, pid: %d\n"
                                (gethash "startMethod" body)
                                (gethash "name" body)
                                (gethash "systemProcessId" body))
                        'event)))
 (add-hook 'dapdbg--process-callback-list #'dapdbg-ui--handle-process-event)
+
+(defun dapdbg-ui--handle-progress-event (parsed-msg)
+  (let* ((body (gethash "body" parsed-msg))
+         (msg (or (gethash "message" body)
+                  (gethash "title" body)
+                  nil))
+         (id (gethash "id" body))
+         (pct (or (gethash "percentage" body) "<na>")))
+    (dapdbg-ui--progress id pct msg)))
+
+(add-hook 'dapdbg--progressStart-list #'dapdbg-ui--handle-progress-event)
+(add-hook 'dapdbg--progressUpdate-list #'dapdbg-ui--handle-progress-event)
+(add-hook 'dapdbg--progressEnd-list #'dapdbg-ui--handle-progress-event)
 
 (defun dapdbg-ui--handle-exited-event (parsed-msg)
   (dapdbg-ui--output "# Event: exited\n" 'event))
@@ -841,7 +907,11 @@ from the instruction cache around PROGRAM-COUNTER."
     (dapdbg-ui--output (gethash "output" body) (gethash "category" body))))
 (add-hook 'dapdbg--output-callback-list #'dapdbg-ui--handle-output-event)
 
-(defun dapdbg-ui--handle-stopped-event (_parsed-msg)
+(defun dapdbg-ui--handle-stopped-event (parsed-msg)
+  (let* ((body (gethash "body" parsed-msg))
+         (reason (gethash "reason" body))
+         (msg (or (gethash "description" body) reason)))
+    (dapdbg-ui--output (format "# Event stopped (%s)\n" msg) 'event))
   ;; current thread ID has already been set on the session object
   (dapdbg--request-stacktrace nil #'dapdbg-ui--handle-stacktrace-response)
   (dapdbg--request-threads #'dapdbg-ui--handle-threads-response))
