@@ -57,6 +57,7 @@ and display of those."
   "C-<f3>" #'dapdbg-stepi
   "S-<f3>" #'dapdbg-finish
   "<f4>" #'dapdbg-continue
+  "C-<f4>" #'dapdbg-pause
   )
 
 (define-minor-mode dapdbg-ui-mode
@@ -136,6 +137,12 @@ information. It includes a keymap for basic debugger control."
 (defun dapdbg-ui-start-lldb (command-line)
   (interactive (list (read-shell-command "Target (command-line): ")))
   (dapdbg--start-lldb command-line))
+
+(defun dapdbg-ui-attach-lldb (pid &optional program)
+  (interactive "nProcess ID (pid): ")
+  (unless program
+    (setq program (read-shell-command "Target program (optional): ")))
+  (dapdbg--attach-lldb pid (if (string-empty-p program) nil program)))
 
 (defun dapdbg-ui-start-gdb (command-line)
   (interactive (list (read-shell-command "Target (command-line): ")))

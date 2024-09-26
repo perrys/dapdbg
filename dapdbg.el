@@ -188,6 +188,40 @@ capabilities of the debugger."
          (dapdbg--send-request "launch"
                                (dapdbg--make-launch-request-args dapdbg--lldb-type program program-arguments extra-launch-args)))))))
 
+(defun dapdbg--make-attach-request-args (debugger-type pid &optional program additional-args)
+  "Make the arguments for an attach request to the
+debugger. ADDITIONAL-ARGS is a plist of extra arguments to the
+attach request (which is debugger-dependent)."
+  (let ((attach-args (list
+                      :name (if program (file-name-nondirectory program) (format "pid_%d" pid))
+                      :type debugger-type
+                      :pid pid
+                      :request "attach")))
+    (when program
+      (plist-put launch-args :program program))
+    (setq attach-args (nconc attach-args additional-args))
+    attach-args))
+
+(defun dapdbg--attach-lldb (pid &optional program)
+  "Attach the LLDB debugger to an existing process PID. If supplied,
+PROGRAM is the binary for the existing process, which will help
+to resolve breakpoints more quickly."
+  (when (dapdbg--connected-p)
+    (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
+      ("y" (dapdbg-quit))
+      (_ (error "Aborted"))))
+  (dapdbg--connect dapdbg-lldb-command-line dapdbg--lldb-type)
+  (dapdbg--request-initialize
+   (lambda (response)
+     ;; https://github.com/llvm/llvm-project/tree/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap#launching--attaching-configuration
+     (let ((extra-attach-args nil))
+       (let ((srcmap (apply 'vector (mapcar (lambda (mapping) (vector (car mapping) (cdr mapping)))
+                                            dapdbg-lldb-source-mappings))))
+         (unless (seq-empty-p srcmap)
+           (plist-put extra-attach-args :sourceMap srcmap)))
+       (dapdbg--send-request "attach"
+                             (dapdbg--make-attach-request-args dapdbg--lldb-type pid program extra-attach-args))))))
+
 (defun dapdbg--start-gdb (command-line)
   "Use GDB to launch and debug the program and arguments given in
 COMMAND-LINE. If a GDB process
@@ -275,6 +309,7 @@ on, after which make a configurationDone request."
 (dapdbg--make-thread-command "step" "stepIn" "Step one source line.")
 (dapdbg--make-thread-command "stepi" "stepIn" "Step one instruction." '(:granularity "instruction") "supportsSteppingGranularity")
 (dapdbg--make-thread-command "finish" "stepOut" "Finish executing the current function.")
+(dapdbg--make-thread-command "pause" "pause" "Pause exceution.")
 (dapdbg--make-thread-command "continue" "continue" "Resume exceution.")
 
 ;; ------------------- breakpoint logic ---------------------
