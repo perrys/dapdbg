@@ -80,54 +80,6 @@ information. It includes a keymap for basic debugger control."
 (defun dapdbg-ui-mode--disable ()
   (dapdbg-ui--set-left-margin 0))
 
-(defvar-keymap dapdbg-ui-variables-mode-map
-  :doc "Local keymap for `dapdbg-ui-variables-mode' buffers."
-  :parent (make-composed-keymap dapdbg-ui-mode-map tabulated-list-mode-map)
-  "TAB" #'dapdbg-ui--toggle-expand-variable)
-
-(define-derived-mode dapdbg-ui-variables-mode tabulated-list-mode "vars"
-  "Major mode for local variables display"
-  :interactive nil
-  (setq tabulated-list-format
-        (vector '("Name" 16 nil :right-align nil)
-                '("Type" 16 nil)
-                '("Value" 999 nil)))
-  (tabulated-list-init-header))
-
-(defvar-keymap dapdbg-ui-call-stack-mode-map
-  :doc "Local keymap for `STrace' buffers."
-  :parent (make-composed-keymap dapdbg-ui-mode-map tabulated-list-mode-map)
-  "RET" #'dapdbg-ui--select-stack-frame)
-
-(define-derived-mode dapdbg-ui-call-stack-mode tabulated-list-mode "stack"
-  "Major mode for stack trace display"
-  :interactive nil
-  (let ((addr-width (length (format dapdbg-ui-address-format 0))))
-    (setq tabulated-list-format
-          (vector '("Idx" 3 nil :right-align t)
-                  `("Prog Counter" ,(if (> addr-width 1) addr-width 16) nil)
-                  '("Function" 999 nil))))
-  (tabulated-list-init-header))
-
-(defvar-keymap dapdbg-ui-output-mode-map
-  :doc "Local keymap for `dapdbg I/O' buffers."
-  :parent dapdbg-ui-mode-map
-  "M-p" #'dapdbg-ui-previous-input
-  "M-n" #'dapdbg-ui-next-input
-  "RET" #'dapdbg-ui-send-input)
-
-(define-derived-mode dapdbg-ui-output-mode fundamental-mode "dbgIO"
-  "Major mode for the debugger REPL and process output"
-  :interactive nil)
-
-(defvar-keymap dapdbg-ui-asm-mode-map
-  :doc "Local keymap for disassembly buffers."
-  :parent dapdbg-ui-mode-map)
-
-(define-derived-mode dapdbg-ui-asm-mode asm-mode "disassembly"
-  "Major mode for the debugger's disassembly buffer"
-  :interactive nil)
-
 ;; ------------------- commands ---------------------
 
 (defun dapdbg-ui-start-lldb (command-line)
@@ -262,6 +214,17 @@ accounting for existing breakpoint markers."
 
 (defconst dapdbg-ui--interaction-buffer-name "*Debugger REPL*")
 
+(defvar-keymap dapdbg-ui-output-mode-map
+  :doc "Local keymap for `dapdbg I/O' buffers."
+  :parent dapdbg-ui-mode-map
+  "M-p" #'dapdbg-ui-previous-input
+  "M-n" #'dapdbg-ui-next-input
+  "RET" #'dapdbg-ui-send-input)
+
+(define-derived-mode dapdbg-ui-output-mode fundamental-mode "dbgIO"
+  "Major mode for the debugger REPL and process output"
+  :interactive nil)
+
 (defun dapdbg-ui--get-repl-buffer ()
   "Get the main buffer used to interact with the debugger."
   (let* ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--interaction-buffer-name))
@@ -365,6 +328,21 @@ prompt, and subsequent updates are written to the same line."
 
 (defconst dapdbg-ui--call-stack-buffer-name "*Stack Frames*")
 
+(defvar-keymap dapdbg-ui-call-stack-mode-map
+  :doc "Local keymap for `STrace' buffers."
+  :parent (make-composed-keymap dapdbg-ui-mode-map tabulated-list-mode-map)
+  "RET" #'dapdbg-ui--select-stack-frame)
+
+(define-derived-mode dapdbg-ui-call-stack-mode tabulated-list-mode "stack"
+  "Major mode for stack trace display"
+  :interactive nil
+  (let ((addr-width (length (format dapdbg-ui-address-format 0))))
+    (setq tabulated-list-format
+          (vector '("Idx" 3 nil :right-align t)
+                  `("Prog Counter" ,(if (> addr-width 1) addr-width 16) nil)
+                  '("Function" 999 nil))))
+  (tabulated-list-init-header))
+
 (defun dapdbg-ui--get-call-stack-buffer ()
   (let ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--call-stack-buffer-name)))
     (when (cdr buf-created)
@@ -449,6 +427,23 @@ the debugee is current stopped at."
       )))
 
 ;; ------------------- variables & registers ---------------------
+
+(defconst dapdbg-ui--variables-buffer-name "*Variables*")
+(defconst dapdbg-ui--registers-buffer-name "*Registers*")
+
+(defvar-keymap dapdbg-ui-variables-mode-map
+  :doc "Local keymap for `dapdbg-ui-variables-mode' buffers."
+  :parent (make-composed-keymap dapdbg-ui-mode-map tabulated-list-mode-map)
+  "TAB" #'dapdbg-ui--toggle-expand-variable)
+
+(define-derived-mode dapdbg-ui-variables-mode tabulated-list-mode "vars"
+  "Major mode for local variables display"
+  :interactive nil
+  (setq tabulated-list-format
+        (vector '("Name" 16 nil :right-align nil)
+                '("Type" 16 nil)
+                '("Value" 999 nil)))
+  (tabulated-list-init-header))
 
 (cl-defstruct dapdbg-ui--var-tree
   "Holds the tree structure of variables data. The hash table holds
@@ -612,9 +607,6 @@ PARENT-ID provided in CHILD-LIST."
           (dapdbg-ui--refresh-variables-display)))) ; at a leaf node
     (display-buffer buf)))
 
-(defconst dapdbg-ui--variables-buffer-name "*Variables*")
-(defconst dapdbg-ui--registers-buffer-name "*Registers*")
-
 (defun dapdbg-ui--registers-update (_call-stack-id parent-id child-list)
   "Update registers buffer with (partial) tree data"
   (with-current-buffer dapdbg-ui--registers-buffer-name
@@ -663,6 +655,14 @@ PARENT-ID provided in CHILD-LIST."
 ;; ------------------- disassembly ---------------------
 
 (defconst dapdbg-ui--disassembly-buffer-name "*Disassembly*")
+
+(defvar-keymap dapdbg-ui-asm-mode-map
+  :doc "Local keymap for disassembly buffers."
+  :parent dapdbg-ui-mode-map)
+
+(define-derived-mode dapdbg-ui-asm-mode asm-mode "disassembly"
+  "Major mode for the debugger's disassembly buffer"
+  :interactive nil)
 
 (defun dapdbg-ui--get-disassembly-buffer ()
   (let ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--disassembly-buffer-name)))
@@ -804,6 +804,16 @@ from the instruction cache around PROGRAM-COUNTER."
                 '("0123456789abcdef" 16 nil)))
   (tabulated-list-init-header))
 
+(defun dapdbg-ui--mutate-to-ascii (bytes)
+  (let ((i 0)
+        (len (length bytes)))
+    (while (< i len)
+      (let ((c (aref bytes i)))
+        (if (or (< c #x20) (> c ?~))
+            (aset bytes i ?.)
+          (cl-incf i)))))
+  bytes)
+
 (defun dapdbg-ui--render-line (addr bytes)
   (let ((line (make-vector 10 "")))
     (aset line 0 (format "%012x" addr))
@@ -815,6 +825,7 @@ from the instruction cache around PROGRAM-COUNTER."
     (aset line 6 (concat (format "%02x" (aref bytes 10)) (format "%02x" (aref bytes 11))))
     (aset line 7 (concat (format "%02x" (aref bytes 12)) (format "%02x" (aref bytes 13))))
     (aset line 8 (concat (format "%02x" (aref bytes 14)) (format "%02x" (aref bytes 15))))
+    (aset line 9 (dapdbg-ui--mutate-to-ascii bytes))
     line))
 
 (defun dapdbg-ui--display-memory (start data)
@@ -939,6 +950,12 @@ from the instruction cache around PROGRAM-COUNTER."
      (display-buffer-in-side-window)
      (side . left)
      (slot . 2)))
+  (add-to-list
+   'display-buffer-alist
+   `(,dapdbg-ui--memory-view-buffer-name
+     (display-buffer-in-side-window)
+     (side . bottom)
+     (slot . 1)))
   (add-to-list
    'display-buffer-alist
    `(,dapdbg-ui--disassembly-buffer-name

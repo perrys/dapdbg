@@ -453,6 +453,8 @@ the `StackTraceResponse' parsed message."
   (dapdbg--send-request "variables" (list :variablesReference ref-id) callback))
 
 (defun dapdbg--request-memory-dump (start-address count &optional callback)
+  (unless (gethash "supportsReadMemoryRequest" (dapdbg-session-capabilities dapdbg--ssn))
+    (error "Debugger does not have capability \"supportsReadMemoryRequest\""))
   (dapdbg--send-request "readMemory" (list :memoryReference (format "0x%x" start-address) :count count) callback))
 
 (defun dapdbg--request-eval-repl (expr &optional callback)
