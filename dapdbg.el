@@ -87,6 +87,7 @@ breakpoints and latest thread/stack state when stopped."
   (buffer "")
   (seq 0)
   (thread-id nil)
+  (target-state nil)
   (launch-args nil)
   (config-done nil)
   (capabilities nil))
@@ -214,7 +215,7 @@ to resolve breakpoints more quickly."
   (dapdbg--request-initialize
    (lambda (response)
      ;; https://github.com/llvm/llvm-project/tree/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap#launching--attaching-configuration
-     (let ((extra-attach-args nil))
+     (let ((extra-attach-args (list :initCommands dapdbg-lldb-init-commands)))
        (let ((srcmap (apply 'vector (mapcar (lambda (mapping) (vector (car mapping) (cdr mapping)))
                                             dapdbg-lldb-source-mappings))))
          (unless (seq-empty-p srcmap)
@@ -293,22 +294,27 @@ on, after which make a configurationDone request."
 
 ;; ------------------- commands ---------------------
 
-(defmacro dapdbg--make-thread-command (name command docstring &optional args capability)
+(defmacro dapdbg--make-thread-command (name command docstring &optional args capability setup-fn)
   `(defun ,(intern (format "dapdbg-%s" name)) ()
      ,docstring
      (interactive)
      ,(if capability
           `(unless (gethash ,capability (dapdbg-session-capabilities dapdbg--ssn))
              (error "Debugger does not have capability: \"%s\"" ,capability)))
+     ,(if setup-fn
+          `(funcall ,setup-fn))
      (let ((pargs (list :threadId (dapdbg-session-thread-id dapdbg--ssn))))
        ,(when args `(nconc pargs ,args))
        (dapdbg--send-request ,command pargs))))
 
-(dapdbg--make-thread-command "next" "next" "Step one line (skip functions).")
-(dapdbg--make-thread-command "nexti" "next" "Step one instruction (skip functions)." '(:granularity "instruction") "supportsSteppingGranularity")
-(dapdbg--make-thread-command "step" "stepIn" "Step one source line.")
-(dapdbg--make-thread-command "stepi" "stepIn" "Step one instruction." '(:granularity "instruction") "supportsSteppingGranularity")
-(dapdbg--make-thread-command "finish" "stepOut" "Finish executing the current function.")
+(defun dapdbg--set-stepping-state ()
+  (setf (dapdbg-session-target-state dapdbg--ssn) 'stepping))
+
+(dapdbg--make-thread-command "next" "next" "Step over one source line (skip functions)." nil nil #'dapdbg--set-stepping-state)
+(dapdbg--make-thread-command "nexti" "next" "Step over one instruction (skip functions)." '(:granularity "instruction") "supportsSteppingGranularity" #'dapdbg--set-stepping-state)
+(dapdbg--make-thread-command "step" "stepIn" "Step into one source line (into functions)." nil nil #'dapdbg--set-stepping-state)
+(dapdbg--make-thread-command "stepi" "stepIn" "Step into one instruction." '(:granularity "instruction") "supportsSteppingGranularity" #'dapdbg--set-stepping-state)
+(dapdbg--make-thread-command "finish" "stepOut" "Finish executing the current function (step out)." nil nil #'dapdbg--set-stepping-state)
 (dapdbg--make-thread-command "pause" "pause" "Pause exceution.")
 (dapdbg--make-thread-command "continue" "continue" "Resume exceution.")
 
@@ -456,28 +462,21 @@ the `StackTraceResponse' parsed message."
 updated. The callback receives a hash table of filename ->
 breakpoint table mappings.")
 
-(defvar dapdbg--stopped-callback-list nil
-  "Functions to call when the debugger sends a 'stopped' event. The
+(defmacro dapdbg--make-event-callback-list (event-type)
+  `(defvar ,(intern (format "dapdbg--%s-callback-list" event-type)) nil
+     ,(format "Functions to call when the debugger sends an '%s' event. The
    callbacks receive the event message (i.e. this is an abnormal
-   hook).")
+   hook)." event-type)))
 
-(defvar dapdbg--continued-callback-list nil
-  "Functions to call when the debugger sends a 'continued' event.")
-
-(defvar dapdbg--output-callback-list nil
-  "Functions to call when the debugger sends an 'output' event.")
-
-(defvar dapdbg--thread-callback-list nil
-  "Functions to call when the debugger sends an 'thread' event.")
-
-(defvar dapdbg--breakpoint-callback-list nil
-  "Functions to call when the debugger sends an 'breakpoint' event.")
-
-(defvar dapdbg--exited-callback-list nil
-  "Functions to call when the debugger sends an 'exited' event.")
-
-(defvar dapdbg--terminated-callback-list nil
-  "Functions to call when the debugger sends an 'terminated' event.")
+(dapdbg--make-event-callback-list "breakpoint")
+(dapdbg--make-event-callback-list "continued")
+(dapdbg--make-event-callback-list "exited")
+(dapdbg--make-event-callback-list "module")
+(dapdbg--make-event-callback-list "output")
+(dapdbg--make-event-callback-list "process")
+(dapdbg--make-event-callback-list "stopped")
+(dapdbg--make-event-callback-list "thread")
+(dapdbg--make-event-callback-list "terminated")
 
 (defun dapdbg--handle-event-stopped (msg)
   (let ((tid (gethash "threadId" (gethash "body" msg))))
@@ -558,15 +557,17 @@ call with the result), invoking `dapdbg--send-request' each time."
      (dapdbg--handle-event-initialized parsed-msg))
     ("stopped"
      (dapdbg--handle-event-stopped parsed-msg)
-     (run-hook-with-args 'dapdbg--stopped-callback-list parsed-msg))
+     (run-hook-with-args 'dapdbg--stopped-callback-list parsed-msg)
+     (setf (dapdbg-session-target-state dapdbg--ssn) 'stopped))
+    ("continued"
+     (run-hook-with-args 'dapdbg--continued-callback-list parsed-msg)
+     (setf (dapdbg-session-target-state dapdbg--ssn) 'running))
+    ("process"
+     (run-hook-with-args 'dapdbg--process-callback-list parsed-msg)
+     (setf (dapdbg-session-target-state dapdbg--ssn) 'running))
     ("breakpoint"
      (dapdbg--handle-event-breakpoint parsed-msg)
      (run-hook-with-args 'dapdbg--breakpoint-callback-list parsed-msg))
-    ("process" (let ((body (gethash "body" parsed-msg)))
-                 (message "%sed %s, pid: %d"
-                          (gethash "startMethod" body)
-                          (gethash "name" body)
-                          (gethash "systemProcessId" body))))
     (`,an-event
      (if-let ((sym (intern-soft (format "dapdbg--%s-callback-list" an-event))))
          (run-hook-with-args sym parsed-msg)

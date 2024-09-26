@@ -277,8 +277,7 @@ accounting for existing breakpoint markers."
       (let ((props (list 'read-only t)))
         (pcase category
           ("stderr" (plist-put props 'face 'font-lock-warning-face))
-          ("repl-input" (plist-put props 'face 'font-lock-comment-face))
-          ("repl-output" (plist-put props 'face 'font-lock-string-face)))
+          ('event (plist-put props 'face 'font-lock-comment-face)))
         (add-text-properties 0 (length data) props data)
         (goto-char dapdbg-ui--output-mark)
         (let ((inhibit-read-only t)) (insert data))
@@ -815,10 +814,31 @@ from the instruction cache around PROGRAM-COUNTER."
 (defun dapdbg-ui--handle-threads-response (parsed-msg)
   nil) ;; TODO
 
+(defun dapdbg-ui--handle-process-event (parsed-msg)
+  (let ((body (gethash "body" parsed-msg)))
+    (dapdbg-ui--output (format "# %sed %s, pid: %d\n"
+                               (gethash "startMethod" body)
+                               (gethash "name" body)
+                               (gethash "systemProcessId" body))
+                       'event)))
+(add-hook 'dapdbg--process-callback-list #'dapdbg-ui--handle-process-event)
+
+(defun dapdbg-ui--handle-exited-event (parsed-msg)
+  (dapdbg-ui--output "# Event: exited\n" 'event))
+(add-hook 'dapdbg--exited-callback-list #'dapdbg-ui--handle-exited-event)
+
+(defun dapdbg-ui--handle-terminated-event (parsed-msg)
+  (dapdbg-ui--output "# Event: terminated\n" 'event))
+(add-hook 'dapdbg--terminated-callback-list #'dapdbg-ui--handle-terminated-event)
+
+(defun dapdbg-ui--handle-continued-event (parsed-msg)
+  (unless (eq 'stepping (dapdbg-session-target-state dapdbg--ssn))
+    (dapdbg-ui--output "# Event: continued\n" 'event)))
+(add-hook 'dapdbg--continued-callback-list #'dapdbg-ui--handle-continued-event)
+
 (defun dapdbg-ui--handle-output-event (parsed-msg)
   (let ((body (gethash "body" parsed-msg)))
     (dapdbg-ui--output (gethash "output" body) (gethash "category" body))))
-
 (add-hook 'dapdbg--output-callback-list #'dapdbg-ui--handle-output-event)
 
 (defun dapdbg-ui--handle-stopped-event (_parsed-msg)
