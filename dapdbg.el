@@ -50,6 +50,16 @@ called 'lldb-dap' since version 18."
   :group 'dapdbg
   :type `(repeat string))
 
+(defcustom dapdbg-codelldb-path (expand-file-name "~/.vscode/extensions/vadimcn.vscode-lldb-1.10.0/adapter/codelldb")
+  "Command-line to invoke the lldb debugger process.
+
+The LLDB debugger ships with a separate binary for the DAP server
+- on older versions this is called 'lldb-vscode', and it is
+called 'lldb-dap' since version 18."
+  :group 'dapdbg
+  :type `(repeat string))
+
+
 (defcustom dapdbg-gdb-command-line '("gdb" "-i" "dap")
   "Command-line to invoke the gdb debugger process.
 
@@ -81,6 +91,7 @@ version 14 onwards."
 for keeping track of things like initialization state, request-response callbacks,
 breakpoints and latest thread/stack state when stopped."
   (process nil :read-only t)
+  (network-process nil :read-only t)
   (type nil :read-only t)
   (callbacks (make-hash-table :test 'equal) :read-only t)
   (source-breakpoints (make-hash-table :test 'equal) :read-only t)
@@ -96,6 +107,7 @@ breakpoints and latest thread/stack state when stopped."
   "The global session object (only one session is allowed).")
 
 (defconst dapdbg--lldb-type "lldb-dap")
+(defconst dapdbg--codelldb-type "codelldb")
 (defconst dapdbg--gdb-type "gdb-dap")
 
 (defun dapdbg--connect (command-line debugger-type)
@@ -116,6 +128,54 @@ breakpoints and latest thread/stack state when stopped."
         (maphash (lambda (k v) (puthash k v new-bps))
                  old-bps)))
     ))
+
+(defun dapdbg--server-connection (program debugger-type)
+  "Open a listener socket, then start the debugger and wait for it to connect."
+  (let ((listener nil)
+        (listener-port nil)
+        (client nil)
+        (retries 0)
+        (proc nil)
+        (prev-ssn dapdbg--ssn))
+    (setq listener (make-network-process
+                    :name "dapdbg-listener"
+                    :server t
+                    :host 'local
+                    :service t
+                    :coding 'no-conversion
+                    :filter #'dapdbg--handle-server-message
+                    :sentinel (lambda (process event)
+                                (cond
+                                 ((string-match "open.*" event)
+                                  (setq client process)
+                                  (message "codelldb connected on %d"
+                                           (process-contact process :service)))
+                                 (t (message "sentinel: %s got %s" process event))))
+                    :noquery t))
+    (setq port (process-contact listener :service))
+    (message "listening for codelldb on %d" port)
+    (setq proc (make-process
+                :name "dapdbg-session"
+                :connection-type 'pipe
+                :command (list program "--connect" (int-to-string port))
+                :buffer "*debugger stdout*"
+                :stderr "*debugger stderr*"
+                :noquery t))
+    (while (or (not client) (< retries 100))
+      (sit-for 0.01)
+      (cl-incf retries))
+    (unless client
+      (error "Timed out waiting for connection from codelldb"))
+    (stop-process listener)
+    (delete-process listener)
+    (setq dapdbg--ssn (make-dapdbg-session
+                       :process proc :type debugger-type :network-process client))
+    (when prev-ssn
+      (let ((old-bps (dapdbg-session-source-breakpoints prev-ssn))
+            (new-bps (dapdbg-session-source-breakpoints dapdbg--ssn)))
+        (maphash (lambda (k v) (puthash k v new-bps))
+                 old-bps)))))
+
 
 (defun dapdbg--make-launch-request-args (debugger-type program &optional program-arguments additional-args)
   "Send a launch request to the debugger. ADDITIONAL-ARGS is a plist
@@ -253,6 +313,14 @@ is already running in the current session, it will be re-used."
         ;; set the launch to occur after the configurationDone event:
         (setf (dapdbg-session-launch-args dapdbg--ssn) launch-args)
         (dapdbg--request-initialize)))))
+
+(defun dapdbg--start-codelldb (command-line)
+  "Start or restart the CodeLLDB debugger, and launch the program from COMMAND-LINE."
+  (when (dapdbg--connected-p)
+    (pcase (substring (downcase (read-string "A debugger is already running, terminate and replace it (y/n)? " "y")) 0 1)
+      ("y" (dapdbg-quit))
+      (_ (error "Aborted"))))
+  (dapdbg--server-connection dapdbg-codelldb-path dapdbg--codelldb-type))
 
 (defun dapdbg--connected-p ()
   (and dapdbg--ssn
@@ -538,7 +606,9 @@ of arguments as a plist."
     (dapdbg--log-io-message hdrs body t)
     (if callback
         (dapdbg--register-callback seq callback))
-    (process-send-string (dapdbg-session-process dapdbg--ssn) (format "%s\r\n%s" hdrs body))))
+    (let ((proc (or (dapdbg-session-network-process dapdbg--ssn)
+                    (dapdbg-session-process dapdbg--ssn))))
+    (process-send-string proc (format "%s\r\n%s" hdrs body)))))
 
 (defun dapdbg--chain-requests (requests)
   "Excecute a set of requests in sequence. Each element of REQUESTS

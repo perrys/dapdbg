@@ -92,6 +92,10 @@ information. It includes a keymap for basic debugger control."
     (setq program (read-shell-command "Target program (optional): ")))
   (dapdbg--attach-lldb pid (if (string-empty-p program) nil program)))
 
+(defun dapdbg-ui-start-codelldb (command-line)
+  (interactive (list (read-shell-command "Target (command-line): ")))
+  (dapdbg--start-codelldb command-line))
+
 (defun dapdbg-ui-start-gdb (command-line)
   (interactive (list (read-shell-command "Target (command-line): ")))
   (dapdbg--start-gdb command-line))
