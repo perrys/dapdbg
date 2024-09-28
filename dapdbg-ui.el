@@ -253,36 +253,39 @@ accounting for existing breakpoint markers."
   (when (not (string-empty-p data))
     (let ((buf (dapdbg-ui--get-repl-buffer)))
       (with-current-buffer buf
-        (let ((props (list 'read-only t)))
-          (pcase category
-            ("stderr" (plist-put props 'face 'font-lock-warning-face))
-            ('event (plist-put props 'face 'font-lock-comment-face)))
-          (put-text-property (1- (length data)) (1- (length data)) 'rear-nonsticky '(read-only) data)
-          (add-text-properties 0 (1- (length data)) props data)
-          (goto-char (overlay-start dapdbg-ui--prompt-olay))
-          (let ((inhibit-read-only t)) (insert-before-markers data))
-          (goto-char (point-max))))
+        (goto-char (overlay-start dapdbg-ui--prompt-olay))
+        (dapdbg-ui--output-at-point data category)
+        (goto-char (point-max)))
       (display-buffer buf))))
+
+(defun dapdbg-ui--output-at-point (data &optional category)
+  (let ((inhibit-read-only t)
+        (len (length data))
+        (face (pcase category
+                ("stderr" 'font-lock-warning-face)
+                ('event 'font-lock-comment-face)
+                ('progress 'font-lock-comment-face))))
+    (when face
+      (put-text-property 0 (1- len) 'face face data))
+    (insert-before-markers (propertize (substring data 0 (1- len)) 'read-only t))
+    (insert-before-markers (propertize (substring data (1- len) len) 'rear-nonsticky t 'read-only t))))
 
 (defun dapdbg-ui--progress (id percent &optional message)
   "Output a progress indicator into the current buffer. The first
 progess update for ID is inserted into the buffer just before the
 prompt, and subsequent updates are written to the same line."
-  (let ((buf (dapdbg-ui--get-repl-buffer)))
-    (with-current-buffer
-        (let ((progress-record (gethash id dapdbg-ui--progress-table))
-              (output-mark (overlay-start dapdbg-ui--prompt-olay))
-              (props (list 'read-only t 'rear-nonsticky t 'face 'font-lock-comment-face)))
-          (unless progress-record
-            (setq progress-record (puthash id (cons (output-mark) message) dapdbg-ui--progress-table)))
-          (if message
-              (setcdr progress-record message)
-            (setq message (cdr progress-record)))
-          (goto-char (car progress-record))
-          (delete-region (point) (line-end-position))
-          (let ((text (format "# Progress: %s %d%%\n" message percent)))
-            (add-text-properties 0 (length text) props text)
-            (insert-before-markers text))))))
+  (with-current-buffer (dapdbg-ui--get-repl-buffer)
+    (let ((progress-record (gethash id dapdbg-ui--progress-table))
+          (output-mark (overlay-start dapdbg-ui--prompt-olay)))
+      (unless progress-record
+        (setq progress-record (puthash id (cons (output-mark) message) dapdbg-ui--progress-table)))
+      (if message
+          (setcdr progress-record message)
+        (setq message (cdr progress-record)))
+      (goto-char (car progress-record))
+      (delete-region (point) (line-end-position))
+      (let ((text (format "# Progress: %s %d%%\n" message percent)))
+        (dapdbg-ui--output-at-point text 'progress)))))
 
 (defun dapdbg-ui-previous-input (arg)
   (interactive "*p")
