@@ -1,5 +1,34 @@
 ;; dapdbg-ui.el bottom User Interface for dapdbg -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2024 Stewart Perry
+
+;; Author: Stewart Perry <stewart.c.perry@gmail.com>
+;; Created: 31 Aug 2024
+
+;; Keywords: tools
+
+;; This file is not part of GNU Emacs.
+
+;; This file is free software
+
+;;; Commentary:
+
+;; Add-on package for dapdbg providing a UI for interactive debugging. The UI
+;; has several panels (in addition to the source buffer) for native debugging,
+;; similar in nature to those found in the Windows' debugger `windbg', or emacs
+;; built-int GUD debugger with `gdb-many-windows' enabled:
+;;
+;; * Breakpoints
+;; * Stack Frames
+;; * Disassembly
+;; * Variables
+;; * Registers
+;; * Memory View
+;;
+;; This UI only uses built-in features of emacs. In particular, it makes heavy
+;; use of tabulated-list-mode for the majority of the display panels above.
+
+;;; Code:
 
 (require 'dapdbg)
 
@@ -750,7 +779,7 @@ buffer. Return the beginning of line mark."
          (instruction (plist-get cache-entry :data))
          (line (format "%s: %s\n" (dapdbg-ui--addr pc) (gethash "instruction" instruction))))
     (if-let ((symbol (gethash "symbol" instruction)))
-        (insert (propertize (format "\n%s: <%s>\n" (dapdbg-ui--addr pc) symbol) 'read-only t)))
+        (insert (propertize (format "\n%s <%s>:\n" (dapdbg-ui--addr pc) symbol) 'read-only t)))
     (let ((saved-point (point)))
       (insert (propertize line 'read-only t))
       saved-point)))
@@ -997,3 +1026,5 @@ from the instruction cache around PROGRAM-COUNTER."
   )
 
 (provide 'dapdbg-ui)
+
+;;; dabdbg-ui.el ends here

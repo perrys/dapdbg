@@ -17,15 +17,15 @@
 ;; intended to be used for direct communication with native debuggers such as
 ;; GDB (since version 14) and LLDB.
 ;;
-;; The following is a fairly minimal implementation of the DAP for this narrow
-;; use-case; it runs the debugger as a sub-process and communicates with it in
-;; single request/response mode.
-;;
-;; This implementation specifically supports native-debugging features such as
+;; This implementation specifically targets native-debugging features such as
 ;; instruction-level stepping and disassembly/memory views. It does not support
-;; multiple sessions, socket connections and so forth; for a generalized DAP
+;; multiple sessions, interpreted languages etc; for a generalized DAP
 ;; implementation supporting multiple scripting and native languages, see
 ;; [dap-mode](https://emacs-lsp.github.io/dap-mode/).
+;;
+;; The following is a fairly minimal implementation of the DAP for this narrow
+;; use-case, and does not depend on any packages other than those provided by
+;; emacs.
 ;;
 ;; For the full specification of DAP, see
 ;; https://microsoft.github.io/debug-adapter-protocol/specification.
