@@ -698,6 +698,20 @@ by the KEY-PROP property of each element, starting at KEY."
         result
       (nreverse result))))
 
+(defun dapdbg-ui--link-instructions (addr last-instruction current-instruction)
+  (plist-put last-instruction :next addr)
+  (plist-put current-instruction :prev (plist-get last-instruction :addr))
+  ;; Remove symbol data from the current instruction if it is identical to the
+  ;; previous one (e.g. codelldb outputs the same function symbol for every
+  ;; instruction in a function)
+  (let ((last (plist-get last-instruction :data))
+        (current (plist-get current-instruction :data)))
+    (let ((last-symbol (or (gethash "_symbol" last) (gethash "symbol" last)))
+          (current-symbol (or (gethash "_symbol" current) (gethash "symbol" current))))
+      (when (string-equal last-symbol current-symbol)
+        (puthash "_symbol" last-symbol current)
+        (remhash "symbol" current)))))
+
 (defun dapdbg-ui--update-instruction-cache (instructions i-cache)
   "Add INSTRUCTIONS to the cache, with each entry in the
 cache forming a doubly-linked list to the previous and next
@@ -715,8 +729,7 @@ that point)."
               (progn
                 (setq current-instruction existing-instruction)
                 (when last-instruction
-                  (plist-put last-instruction :next addr)
-                  (plist-put existing-instruction :prev (plist-get last-instruction :addr)))
+                  (dapdbg-ui--link-instructions addr last-instruction current-instruction))
                 (when started-new-list-flag
                   (throw 'joined-to-existing-list nil)))
             ;; this is a previously-unseen address
@@ -724,8 +737,7 @@ that point)."
                   (list :addr addr :prev nil :next nil :data instruction))
             (setq started-new-list-flag t)
             (when last-instruction
-              (plist-put last-instruction :next addr)
-              (plist-put current-instruction :prev (plist-get last-instruction :addr)))
+              (dapdbg-ui--link-instructions addr last-instruction current-instruction))
             (puthash addr current-instruction i-cache)))))))
 
 (defun dapdbg-ui--addr (address)
@@ -929,7 +941,8 @@ from the instruction cache around PROGRAM-COUNTER."
   (let* ((body (gethash "body" parsed-msg))
          (reason (gethash "reason" body))
          (msg (or (gethash "description" body) reason)))
-    (dapdbg-ui--output (format "# Event stopped (%s)\n" msg) 'event))
+    (unless (equal "step" reason)
+      (dapdbg-ui--output (format "# Event stopped (%s)\n" msg) 'event)))
   ;; current thread ID has already been set on the session object
   (dapdbg--request-stacktrace nil #'dapdbg-ui--handle-stacktrace-response)
   (dapdbg--request-threads #'dapdbg-ui--handle-threads-response))

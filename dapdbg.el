@@ -144,7 +144,7 @@ breakpoints and latest thread/stack state when stopped."
         (prev-ssn dapdbg--ssn))
     (setq listener (make-network-process
                     :name "dapdbg-listener"
-                    :server t
+                    :server 1
                     :host 'local
                     :service t
                     :coding 'no-conversion
@@ -172,7 +172,7 @@ breakpoints and latest thread/stack state when stopped."
     (unless client
       (error "Timed out waiting for connection from codelldb"))
     (stop-process listener)
-    (delete-process listener)
+    (delete-process listener) ;; TODO - I don't think this works if the client has an open connection to it
     (setq dapdbg--ssn (make-dapdbg-session
                        :process proc :type debugger-type :network-process client))
     (when prev-ssn
@@ -568,8 +568,11 @@ breakpoint table mappings.")
 (dapdbg--make-event-callback-list "terminated")
 
 (defun dapdbg--handle-event-stopped (msg)
-  (let ((tid (gethash "threadId" (gethash "body" msg))))
-    (setf (dapdbg-session-thread-id dapdbg--ssn) tid)))
+  (let* ((body (gethash "body" msg))
+         (tid (gethash "threadId" body))
+         (reason (gethash "reason" body)))
+    (setf (dapdbg-session-thread-id dapdbg--ssn) tid)
+    (setf (dapdbg-session-target-state dapdbg--ssn) (intern (format "stopped-%s" reason)))))
 
 (defun dapdbg--handle-event-breakpoint (msg)
   (let* ((body (gethash "body" msg))
@@ -648,14 +651,14 @@ call with the result), invoking `dapdbg--send-request' each time."
      (dapdbg--handle-event-initialized parsed-msg))
     ("stopped"
      (dapdbg--handle-event-stopped parsed-msg)
-     (run-hook-with-args 'dapdbg--stopped-callback-list parsed-msg)
-     (setf (dapdbg-session-target-state dapdbg--ssn) 'stopped))
+     (run-hook-with-args 'dapdbg--stopped-callback-list parsed-msg))
     ("continued"
-     (run-hook-with-args 'dapdbg--continued-callback-list parsed-msg)
-     (setf (dapdbg-session-target-state dapdbg--ssn) 'running))
+     (unless (eq (dapdbg-session-target-state dapdbg--ssn) 'stepping)
+       (setf (dapdbg-session-target-state dapdbg--ssn) 'running))
+     (run-hook-with-args 'dapdbg--continued-callback-list parsed-msg))
     ("process"
-     (run-hook-with-args 'dapdbg--process-callback-list parsed-msg)
-     (setf (dapdbg-session-target-state dapdbg--ssn) 'running))
+     (setf (dapdbg-session-target-state dapdbg--ssn) 'running)
+     (run-hook-with-args 'dapdbg--process-callback-list parsed-msg))
     ("breakpoint"
      (dapdbg--handle-event-breakpoint parsed-msg)
      (run-hook-with-args 'dapdbg--breakpoint-callback-list parsed-msg))
