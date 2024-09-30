@@ -430,7 +430,7 @@ current buffer."
     (let ((existing-bp (gethash linenumber source-table)))
       (if existing-bp
           (remhash linenumber source-table)
-        (puthash linenumber linenumber source-table)))
+        (puthash linenumber nil source-table)))
     (if (dapdbg--connected-p)
         (dapdbg--request-set-breakpoints-for-file filename)
       (let ((source-table (dapdbg--get-or-create-source-table filename))
@@ -454,6 +454,23 @@ current buffer."
        (if callback
            (funcall callback response))))))
 
+(defun dapdbg--get-breakpoint-for-id (id source-table)
+  ;; O(N) search through the source table for a matching breakpoint - may
+  ;; need to keep another table keyed by ID.
+  (catch 'found
+    (maphash (lambda (_linenumber bp-details)
+               (when (and bp-details (eql id (gethash "id" bp-details)))
+                 (throw 'found bp-details)))
+             source-table)))
+
+(defun dapdbg--update-breakpoint-details (source-table updated-bp)
+  (if-let ((existing-bp (dapdbg--get-breakpoint-for-id (gethash "id" updated-bp) source-table)))
+      (maphash (lambda (key value)
+                 (puthash key value existing-bp))
+               updated-bp)
+    (puthash "hits" 0 updated-bp)
+    (puthash (gethash "line" updated-bp) updated-bp source-table)))
+
 (defun dapdbg--update-breakpoint-table (filename bp-response)
   (unless (equal "setBreakpoints" (gethash "command" bp-response))
     (error "not a breakpoint response"))
@@ -461,11 +478,10 @@ current buffer."
         (updated-table (make-hash-table :test 'equal)))
     (puthash filename source-table updated-table)
     (dolist (bp-details (gethash "breakpoints" (gethash "body" bp-response)))
-      (when (gethash "verified" bp-details)
-        (puthash (gethash "line" bp-details) bp-details source-table)))
+      (dapdbg--update-breakpoint-details source-table bp-details))
     (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table)))
 
-(defun dapdbg--update-breakpoint-table-single-bp (bp-details &optional remove)
+(defun dapdbg--update-breakpoint-table-single-bp (bp-details reason)
   "Update the breakpoint table for this session, usually in response
 to a breakpoint event from the debugger."
   (if-let ((source (gethash "source" bp-details)))
@@ -474,9 +490,12 @@ to a breakpoint event from the debugger."
              (source-table (dapdbg--get-or-create-source-table filename))
              (updated-table (make-hash-table :test 'equal)))
         (puthash filename source-table updated-table)
-        (if remove
-            (remhash linenumber  source-table)
-          (puthash linenumber bp-details source-table))
+        (cond ((string-equal "removed" reason)
+               (remhash linenumber  source-table))
+              ((string-equal "new" reason)
+               (puthash "hits" 0 bp-details)
+               (puthash linenumber bp-details source-table))
+              (t (dapdbg--update-breakpoint-details source-table bp-details)))
         (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table))))
 
 ;; ------------------- disassembly ---------------------
@@ -577,11 +596,7 @@ breakpoint table mappings.")
 (defun dapdbg--handle-event-breakpoint (msg)
   (let* ((body (gethash "body" msg))
          (bp-details (gethash "breakpoint" body)))
-    (pcase (gethash "reason" body)
-      ((or "new" "changed")
-       (dapdbg--update-breakpoint-table-single-bp bp-details))
-      ("removed"
-       (dapdbg--update-breakpoint-table-single-bp bp-details t)))))
+    (dapdbg--update-breakpoint-table-single-bp bp-details (gethash "reason" body))))
 
 ;; ------------------- base protocol ---------------------
 
