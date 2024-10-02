@@ -424,13 +424,7 @@ event. This causes a chain of updates to occur in various panels."
      current-thread-id thread-id
      current-call-stack call-stack))
   (dapdbg-ui--call-stack-display-update call-stack)
-  (dapdbg-ui--set-call-stack-context call-stack)
-  (when (eq (dapdbg-session-target-state dapdbg--ssn) 'stopped-breakpoint)
-    (let ((frame (car call-stack)))
-      (when-let ((source (gethash "source" frame)))
-        (let ((filename (gethash "path" source))
-              (linenumber (gethash "line" frame)))
-          (dapdbg-ui--breakpoint-hit filename linenumber))))))
+  (dapdbg-ui--set-call-stack-context call-stack))
 
 (defun dapdbg-ui--select-stack-frame ()
   "Select the frame at point in the call-stack buffer."
@@ -929,16 +923,25 @@ from the instruction cache around PROGRAM-COUNTER."
            '("What" 999 nil))))
   (tabulated-list-init-header))
 
-(defun dapdbg-ui--make-breakpoint-line (filename linenumber bp-details)
-  (let ((id (gethash "id" bp-details)))
+(defun dapdbg-ui--make-breakpoint-line (bp-details)
+  (let ((id (gethash "id" bp-details))
+        (source (gethash "source" bp-details))
+        (linenumber (gethash "line" bp-details))
+        (addr (gethash "instructionReference" bp-details)))
     (list id
           (vector (format "%d" id)
-                  "src"
+                  (if source
+                      "src"
+                    "n/a")
                   (if (gethash "verified" bp-details) "yes" "no")
                   (cons "yes" nil)
-                  (format dapdbg-ui-address-format (dapdbg--parse-address (gethash "instructionReference" bp-details)))
+                  (if addr
+                      (format dapdbg-ui-address-format (dapdbg--parse-address addr))
+                    "<unknown>")
                   (format "%d" (gethash "hits" bp-details))
-                  (format "%s:%d" (file-name-nondirectory filename) linenumber)))))
+                  (if-let ((filename (if source (gethash "name" source) nil)))
+                      (format "%s:%d" (file-name-nondirectory filename) linenumber)
+                    "")))))
 
 (defun dapdbg-ui--breakpoints-display-update ()
   "Update the table display in the breakpoints buffer."
@@ -950,12 +953,10 @@ from the instruction cache around PROGRAM-COUNTER."
         (font-lock-mode -1)))
     (with-current-buffer (car buf-created)
       (setq tabulated-list-entries nil)
-      (maphash (lambda (filename table)
-                 (maphash (lambda (linenumber bp-details)
-                            (push (dapdbg-ui--make-breakpoint-line filename linenumber bp-details)
-                                  tabulated-list-entries))
-                          table))
-               (dapdbg-session-source-breakpoints dapdbg--ssn))
+      (maphash (lambda (id bp-details)
+                 (push (dapdbg-ui--make-breakpoint-line bp-details)
+                       tabulated-list-entries))
+               (dapdbg-session-breakpoints dapdbg--ssn))
       (setq tabulated-list-entries (nreverse tabulated-list-entries))
       (tabulated-list-print)
       (goto-char (point-min))
@@ -963,17 +964,19 @@ from the instruction cache around PROGRAM-COUNTER."
 
 (defun dapdbg-ui--set-breakpoint-markers (buf source-table)
   (dapdbg-ui--clear-breakpoint-markers buf)
-  (with-current-buffer buf
-    (dolist (linenumber (hash-table-keys source-table))
-      (let ((bp-details (gethash linenumber source-table)))
-        (if (hash-table-p bp-details)
-            (dapdbg-ui--draw-breakpoint-marker buf linenumber (gethash "verified" bp-details))
-          (dapdbg-ui--draw-breakpoint-marker buf linenumber nil))))))
+  (let ((table (dapdbg-session-breakpoints dapdbg--ssn)))
+    (with-current-buffer buf
+      (dolist (linenumber (hash-table-keys source-table))
+        (let* ((id (gethash linenumber source-table))
+               (bp-details (gethash id table)))
+          (if (hash-table-p bp-details)
+              (dapdbg-ui--draw-breakpoint-marker buf linenumber (gethash "verified" bp-details))
+            (dapdbg-ui--draw-breakpoint-marker buf linenumber nil)))))))
 
-(defun dapdbg-ui--breakpoint-hit (filename linenumber)
-  (when-let* ((source-table (gethash filename (dapdbg-session-source-breakpoints dapdbg--ssn)))
-              (bp-details (gethash linenumber source-table)))
-    (cl-incf (gethash "hits" bp-details))))
+(defun dapdbg-ui--breakpoint-hit (ids)
+  (seq-doseq (id ids)
+    (let ((bp-details (gethash id (dapdbg-session-breakpoints dapdbg--ssn))))
+      (cl-incf (gethash "hits" bp-details)))))
 
 (defun dapdbg-ui--refresh-source-breakpoints (filename bp-table)
   (let ((buf (get-file-buffer filename)))
@@ -1032,11 +1035,15 @@ from the instruction cache around PROGRAM-COUNTER."
 (add-hook 'dapdbg--output-callback-list #'dapdbg-ui--handle-output-event)
 
 (defun dapdbg-ui--handle-stopped-event (parsed-msg)
-  (let* ((body (gethash "body" parsed-msg))
-         (reason (gethash "reason" body))
-         (msg (or (gethash "description" body) reason)))
-    (unless (equal "step" reason)
-      (dapdbg-ui--output (format "# Event stopped (%s)\n" msg) 'event)))
+  (let ((target-state (dapdbg-session-target-state dapdbg--ssn)))
+    (unless (eq 'stopped-step target-state)
+      (let* ((body (gethash "body" parsed-msg))
+             (ids (gethash "hitBreakpointIds" body))
+             (reason (gethash "reason" body))
+             (msg (or (gethash "description" body) reason)))
+        (dapdbg-ui--output (format "# Event stopped (%s)\n" msg) 'event)
+        (when (eq 'stopped-breakpoint target-state)
+          (dapdbg-ui--breakpoint-hit ids)))))
   ;; current thread ID has already been set on the session object
   (dapdbg--request-stacktrace nil #'dapdbg-ui--handle-stacktrace-response)
   (dapdbg--request-threads #'dapdbg-ui--handle-threads-response))

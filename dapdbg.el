@@ -51,14 +51,20 @@ called 'lldb-dap' since version 18."
   :type `(repeat string))
 
 (defcustom dapdbg-codelldb-path (expand-file-name "~/.vscode/extensions/vadimcn.vscode-lldb-1.10.0/adapter/codelldb")
-  "Command-line to invoke the lldb debugger process.
+  "Command-line to invoke the codelldb debugger. This debugger ships
+with the VSCode extension of the same name; you can either
+install it using VScode's extension manager, or the appropriate
+`.vsix' file can be downloaded directly from:
 
-The LLDB debugger ships with a separate binary for the DAP server
-- on older versions this is called 'lldb-vscode', and it is
-called 'lldb-dap' since version 18."
+https://github.com/vadimcn/codelldb/releases.
+
+Note that the `.vsix' file is an archive in zip format.
+
+The default setting is the location of the 1.10.0 version
+installed by VSCode on linux.
+"
   :group 'dapdbg
   :type `(repeat string))
-
 
 (defcustom dapdbg-gdb-command-line '("gdb" "-i" "dap")
   "Command-line to invoke the gdb debugger process.
@@ -99,6 +105,7 @@ breakpoints and latest thread/stack state when stopped."
   (network-process nil :read-only t)
   (type nil :read-only t)
   (callbacks (make-hash-table :test 'equal) :read-only t)
+  (breakpoints (make-hash-table :test 'eql) :read-only t)
   (source-breakpoints (make-hash-table :test 'equal) :read-only t)
   (buffer "")
   (seq 0)
@@ -329,7 +336,7 @@ is already running in the current session, it will be re-used."
            (launch-args (dapdbg--make-launch-request-args dapdbg--gdb-type cmd-list extra-launch-args)))
       (if connected
           (dapdbg--send-request "launch"
-                                (dapdbg--make-launch-request-args dapdbg--lldb-type program program-arguments extra-launch-args))
+                                (dapdbg--make-launch-request-args dapdbg--gdb-type cmd-line extra-launch-args))
         (dapdbg--connect dapdbg-gdb-command-line dapdbg--gdb-type)
         ;; set the launch to occur after the configurationDone event:
         (setf (dapdbg-session-launch-args dapdbg--ssn) launch-args)
@@ -455,21 +462,18 @@ current buffer."
            (funcall callback response))))))
 
 (defun dapdbg--get-breakpoint-for-id (id source-table)
-  ;; O(N) search through the source table for a matching breakpoint - may
-  ;; need to keep another table keyed by ID.
-  (catch 'found
-    (maphash (lambda (_linenumber bp-details)
-               (when (and bp-details (eql id (gethash "id" bp-details)))
-                 (throw 'found bp-details)))
-             source-table)))
+  (gethash id (dapdbg-session-breakpoints dapdbg--ssn)))
 
 (defun dapdbg--update-breakpoint-details (source-table updated-bp)
-  (if-let ((existing-bp (dapdbg--get-breakpoint-for-id (gethash "id" updated-bp) source-table)))
-      (maphash (lambda (key value)
-                 (puthash key value existing-bp))
-               updated-bp)
-    (puthash "hits" 0 updated-bp)
-    (puthash (gethash "line" updated-bp) updated-bp source-table)))
+  (let ((id (gethash "id" updated-bp))
+        (table (dapdbg-session-breakpoints dapdbg--ssn)))
+    (if-let ((existing-bp (gethash id table)))
+        (maphash (lambda (key value)
+                   (puthash key value existing-bp))
+                 updated-bp)
+      (puthash "hits" 0 updated-bp)
+      (puthash id updated-bp table)
+      (puthash (gethash "line" updated-bp) id source-table))))
 
 (defun dapdbg--update-breakpoint-table (filename bp-response)
   (unless (equal "setBreakpoints" (gethash "command" bp-response))
@@ -484,19 +488,24 @@ current buffer."
 (defun dapdbg--update-breakpoint-table-single-bp (bp-details reason)
   "Update the breakpoint table for this session, usually in response
 to a breakpoint event from the debugger."
-  (if-let ((source (gethash "source" bp-details)))
+  (let ((id (gethash "id" bp-details))
+        (table (dapdbg-session-breakpoints dapdbg--ssn))
+        (source (gethash "source" bp-details))
+        (updated-table (make-hash-table :test 'equal)))
+    (when source
       (let* ((filename (gethash "path" source))
              (linenumber (gethash "line" bp-details))
-             (source-table (dapdbg--get-or-create-source-table filename))
-             (updated-table (make-hash-table :test 'equal)))
+             (source-table (dapdbg--get-or-create-source-table filename)))
         (puthash filename source-table updated-table)
         (cond ((string-equal "removed" reason)
+               (remhash id table)
                (remhash linenumber  source-table))
               ((string-equal "new" reason)
                (puthash "hits" 0 bp-details)
-               (puthash linenumber bp-details source-table))
+               (puthash id bp-details table)
+               (puthash linenumber id source-table))
               (t (dapdbg--update-breakpoint-details source-table bp-details)))
-        (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table))))
+        (run-hook-with-args 'dapdbg--breakpoints-updated-callback-list updated-table)))))
 
 ;; ------------------- disassembly ---------------------
 
