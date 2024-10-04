@@ -110,6 +110,7 @@ breakpoints and latest thread/stack state when stopped."
   (buffer "")
   (seq 0)
   (thread-id nil)
+  (target-name nil)
   (target-state nil)
   (launch-args nil)
   (config-done nil)
@@ -278,31 +279,36 @@ attach request (which is debugger-dependent)."
   ;; LLDB only completes initialization after the target is loaded, so needs a fresh session for each launch
   (dapdbg--ensure-not-connected)
   (dapdbg--connect dapdbg-lldb-command-line dapdbg--lldb-type)
-  (let* ((cmd-list (dapdbg--split-command-line command-line)))
+  (let ((cmd-list (dapdbg--split-command-line command-line))
+        ;; https://github.com/llvm/llvm-project/tree/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap#launching--attaching-configuration
+        (launch-args
+         (dapdbg--make-launch-request-args
+          dapdbg--lldb-type
+          cmd-list
+          (list :initCommands dapdbg-lldb-init-commands
+                :stopOnEntry t))))
+    (setf (dapdbg-session-target-name dapdbg--ssn) (plist-get launch-args :name))
+    (dapdbg--apply-source-mappings launch-args)
     (dapdbg--request-initialize
      (lambda (response)
-       ;; https://github.com/llvm/llvm-project/tree/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap#launching--attaching-configuration
-       (let ((extra-launch-args
-              (list :initCommands dapdbg-lldb-init-commands
-                    :stopOnEntry t)))
-         (dapdbg--apply-source-mappings extra-launch-args)
-         (dapdbg--send-request "launch"
-                               (dapdbg--make-launch-request-args dapdbg--lldb-type cmd-list extra-launch-args)))))))
+       (dapdbg--send-request "launch" launch-args)))))
 
 (defun dapdbg--start-codelldb (command-line)
   "Start or restart the codelldb debugger, and launch the program from COMMAND-LINE."
   (dapdbg--ensure-not-connected)
   (dapdbg--server-connection dapdbg-codelldb-path dapdbg--codelldb-type)
-  (let* ((cmd-list (dapdbg--split-command-line command-line)))
+  (let ((cmd-list (dapdbg--split-command-line command-line))
+        ;; https://github.com/vadimcn/codelldb/blob/master/MANUAL.md#starting-a-new-debug-session
+        (launch-args
+         (dapdbg--make-launch-request-args
+          dapdbg--lldb-type
+          cmd-list
+          (list :initCommands dapdbg-lldb-init-commands
+                :stopOnEntry t))))
+    (setf (dapdbg-session-target-name dapdbg--ssn) (plist-get launch-args :name))
     (dapdbg--request-initialize
      (lambda (response)
-       ;; https://github.com/vadimcn/codelldb/blob/master/MANUAL.md#starting-a-new-debug-session
-       (let ((extra-launch-args
-              (list :initCommands dapdbg-codelldb-init-commands
-                    :stopOnEntry t)))
-         (dapdbg--apply-source-mappings extra-launch-args)
-         (dapdbg--send-request "launch"
-                               (dapdbg--make-launch-request-args dapdbg--codelldb-type cmd-list extra-launch-args)))))))
+       (dapdbg--send-request "launch" launch-args)))))
 
 (defun dapdbg--attach-lldb (pid &optional program)
   "Attach the LLDB debugger to an existing process PID. If supplied,
@@ -310,34 +316,43 @@ PROGRAM is the binary for the existing process, which will help
 to resolve breakpoints more quickly."
   (dapdbg--ensure-not-connected)
   (dapdbg--connect dapdbg-lldb-command-line dapdbg--lldb-type)
-  (dapdbg--request-initialize
-   (lambda (response)
-     ;; https://github.com/llvm/llvm-project/tree/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap#launching--attaching-configuration
-     (let ((extra-attach-args (list :initCommands dapdbg-lldb-init-commands)))
-       (dapdbg--apply-source-mappings extra-attach-args)
-       (dapdbg--send-request "attach"
-                             (dapdbg--make-attach-request-args dapdbg--lldb-type pid program extra-attach-args))))))
+  ;; https://github.com/llvm/llvm-project/tree/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap#launching--attaching-configuration
+  (let ((attach-args
+         (dapdbg--make-attach-request-args
+          dapdbg--lldb-type
+          pid
+          program
+          (list :initCommands dapdbg-lldb-init-commands))))
+    (setf (dapdbg-session-target-name dapdbg--ssn) (plist-get attach-args :name))
+    (dapdbg--apply-source-mappings attach-args)
+    (dapdbg--request-initialize
+     (lambda (response)
+       (dapdbg--send-request "attach" attach-args)))))
 
 (defun dapdbg--start-gdb (command-line)
   "Use GDB to launch and debug the program and arguments given in
 COMMAND-LINE. If a GDB process
 is already running in the current session, it will be re-used."
-  ;; GDB initializes before the target is loaded, so sessions can be re-used.
-  (let ((connected nil))
-    (if (dapdbg--connected-p)
-        (if (equal (dapdbg-session-type dapdbg--ssn) dapdbg--gdb-type)
-            (setq connected t)
-          (pcase (substring (downcase (read-string "Another debugger is running, terminate and replace it (y/n)? " "y")) 0 1)
-            ("y" (dapdbg-quit))
-            (_ (error "Aborted")))))
-    ;; https://sourceware.org/gdb/current/onlinedocs/gdb.html/Debugger-Adapter-Protocol.html
-    (let* ((cmd-list (dapdbg--split-command-line command-line))
-           (extra-launch-args (list :stopAtBeginningOfMainSubprogram t))
-           (launch-args (dapdbg--make-launch-request-args dapdbg--gdb-type cmd-list extra-launch-args)))
+  (let* ((cmd-list (dapdbg--split-command-line command-line))
+         (launch-args (dapdbg--make-launch-request-args
+                       dapdbg--gdb-type
+                       cmd-list
+                       (list :stopAtBeginningOfMainSubprogram t))))
+    ;; GDB initializes before the target is loaded, so sessions can be re-used.
+    (let ((connected nil))
+      (if (dapdbg--connected-p)
+          (if (equal (dapdbg-session-type dapdbg--ssn) dapdbg--gdb-type)
+              (setq connected t)
+            (pcase (substring (downcase (read-string "Another debugger is running, terminate and replace it (y/n)? " "y")) 0 1)
+              ("y" (dapdbg-quit))
+              (_ (error "Aborted")))))
+      ;; https://sourceware.org/gdb/current/onlinedocs/gdb.html/Debugger-Adapter-Protocol.html
       (if connected
-          (dapdbg--send-request "launch"
-                                (dapdbg--make-launch-request-args dapdbg--gdb-type cmd-line extra-launch-args))
+          (progn
+            (setf (dapdbg-session-target-name dapdbg--ssn) (plist-get launch-args :name))
+            (dapdbg--send-request "launch" launch-args))
         (dapdbg--connect dapdbg-gdb-command-line dapdbg--gdb-type)
+        (setf (dapdbg-session-target-name dapdbg--ssn) (plist-get launch-args :name))
         ;; set the launch to occur after the configurationDone event:
         (setf (dapdbg-session-launch-args dapdbg--ssn) launch-args)
         (dapdbg--request-initialize)))))

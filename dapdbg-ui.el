@@ -245,7 +245,7 @@ accounting for existing breakpoint markers."
 
 ;; ------------------- REPL and I/O ---------------------
 
-(defconst dapdbg-ui--interaction-buffer-name "*Debugger REPL*")
+(defconst dapdbg-ui--interaction-buffer-name "*dapdbg REPL*")
 
 (defvar-keymap dapdbg-ui-output-mode-map
   :doc "Local keymap for `dapdbg I/O' buffers."
@@ -254,7 +254,7 @@ accounting for existing breakpoint markers."
   "M-n" #'dapdbg-ui-next-input
   "RET" #'dapdbg-ui-send-input)
 
-(define-derived-mode dapdbg-ui-output-mode fundamental-mode "dbgIO"
+(define-derived-mode dapdbg-ui-output-mode fundamental-mode "dbg"
   "Major mode for the debugger REPL and process output"
   :interactive nil)
 
@@ -270,8 +270,7 @@ accounting for existing breakpoint markers."
                     dapdbg-ui--input-ring-index nil
                     dapdbg-ui--incomplete-input nil
                     dapdbg-ui--input-ring (make-ring dapdbg-ui-input-ring-size))
-        (font-lock-mode -1))
-      (dapdbg-ui--set-repl-prompt))
+        (font-lock-mode -1)))
     buf))
 
 (defun dapdbg-ui--set-repl-prompt ()
@@ -279,7 +278,8 @@ accounting for existing breakpoint markers."
   (with-current-buffer (dapdbg-ui--get-repl-buffer)
     (overlay-put dapdbg-ui--prompt-olay
                  'before-string (propertize (format "(%s) " (dapdbg-session-type dapdbg--ssn))
-                                            'face 'comint-highlight-prompt))))
+                                            'face 'comint-highlight-prompt))
+    (setq-local mode-name (format "dbg: %s" (dapdbg-session-target-name dapdbg--ssn)))))
 
 (defun dapdbg-ui--output (data &optional category)
   "Output the given data into the repl buffer just before the prompt."
