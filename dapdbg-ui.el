@@ -996,7 +996,7 @@ from the instruction cache around PROGRAM-COUNTER."
 (defun dapdbg-ui--handle-process-event (parsed-msg)
   (dapdbg-ui--set-repl-prompt)
   (let ((body (gethash "body" parsed-msg)))
-    (dapdbg-ui--output (format "# Event: %s %s, pid: %d\n"
+    (dapdbg-ui--output (format "# Event: %s %s, pid: %s\n"
                                (gethash "startMethod" body)
                                (gethash "name" body)
                                (gethash "systemProcessId" body))

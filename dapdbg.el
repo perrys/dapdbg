@@ -279,36 +279,54 @@ attach request (which is debugger-dependent)."
   ;; LLDB only completes initialization after the target is loaded, so needs a fresh session for each launch
   (dapdbg--ensure-not-connected)
   (dapdbg--connect dapdbg-lldb-command-line dapdbg--lldb-type)
-  (let ((cmd-list (dapdbg--split-command-line command-line))
-        ;; https://github.com/llvm/llvm-project/tree/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap#launching--attaching-configuration
-        (launch-args
-         (dapdbg--make-launch-request-args
-          dapdbg--lldb-type
-          cmd-list
-          (list :initCommands dapdbg-lldb-init-commands
-                :stopOnEntry t))))
+  (let* ((cmd-list (dapdbg--split-command-line command-line))
+         ;; https://github.com/llvm/llvm-project/tree/012dbec604c99a8f144c4d19357e61b65d2a7b78/lldb/tools/lldb-dap#launching--attaching-configuration
+         (launch-args
+          (dapdbg--make-launch-request-args
+           dapdbg--lldb-type
+           cmd-list
+           (list :initCommands dapdbg-lldb-init-commands
+                 :stopOnEntry t))))
     (setf (dapdbg-session-target-name dapdbg--ssn) (plist-get launch-args :name))
     (dapdbg--apply-source-mappings launch-args)
     (dapdbg--request-initialize
      (lambda (response)
        (dapdbg--send-request "launch" launch-args)))))
 
+(defun dapdbg--fake-process-event (name start-method &optional pid)
+  (let ((msg (make-hash-table :test 'equal))
+        (body (make-hash-table :test 'equal)))
+    (puthash "name" name body)
+    (puthash "startMethod" start-method body)
+    (when pid
+      (puthash "systemProcessId" pid body))
+    (puthash "event" "process" msg)
+    (puthash "type" "event"  msg)
+    (puthash "body" body msg)
+    msg))
+
 (defun dapdbg--start-codelldb (command-line)
   "Start or restart the codelldb debugger, and launch the program from COMMAND-LINE."
   (dapdbg--ensure-not-connected)
   (dapdbg--server-connection dapdbg-codelldb-path dapdbg--codelldb-type)
-  (let ((cmd-list (dapdbg--split-command-line command-line))
-        ;; https://github.com/vadimcn/codelldb/blob/master/MANUAL.md#starting-a-new-debug-session
-        (launch-args
-         (dapdbg--make-launch-request-args
-          dapdbg--lldb-type
-          cmd-list
-          (list :initCommands dapdbg-lldb-init-commands
-                :stopOnEntry t))))
+  (let* ((cmd-list (dapdbg--split-command-line command-line))
+         ;; https://github.com/vadimcn/codelldb/blob/master/MANUAL.md#starting-a-new-debug-session
+         (launch-args
+          (dapdbg--make-launch-request-args
+           dapdbg--codelldb-type
+           cmd-list
+           (list :initCommands dapdbg-lldb-init-commands
+                 :stopOnEntry t))))
     (setf (dapdbg-session-target-name dapdbg--ssn) (plist-get launch-args :name))
     (dapdbg--request-initialize
      (lambda (response)
-       (dapdbg--send-request "launch" launch-args)))))
+       (dapdbg--send-request
+        "launch"
+        launch-args
+        (lambda (parsed-msg) ;; codelldb doesn't emit a process event, so we will fake one
+          (setf (dapdbg-session-target-state dapdbg--ssn) 'running)
+          (run-hook-with-args 'dapdbg--process-callback-list
+                              (dapdbg--fake-process-event (car cmd-list) "launch"))))))))
 
 (defun dapdbg--attach-lldb (pid &optional program)
   "Attach the LLDB debugger to an existing process PID. If supplied,
