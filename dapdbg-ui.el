@@ -2,21 +2,7 @@
 
 ;; Copyright (C) 2024 Stewart Perry
 
-;; Author: Stewart Perry <stewart.c.perry@gmail.com>
-;; Created: 31 Aug 2024
-
-;; Keywords: tools
-
-;; This file is not part of GNU Emacs.
-
-;; This file is free software
-
-;;; Commentary:
-
-;; Add-on package for dapdbg providing a UI for interactive debugging. The UI
-;; has several panels (in addition to the source buffer) for native debugging,
-;; similar in nature to those found in the Windows' debugger `windbg', or emacs
-;; built-int GUD debugger with `gdb-many-windows' enabled:
+;; Author: Stewart Perry <stewart.-windows' enabled:
 ;;
 ;; * Breakpoints
 ;; * Stack Frames
@@ -124,6 +110,12 @@ information. It includes a keymap for basic debugger control."
 (defun dapdbg-ui-start-codelldb (command-line)
   (interactive (list (read-shell-command "Target (command-line): ")))
   (dapdbg--start-codelldb command-line))
+
+(defun dapdbg-ui-attach-codelldb (pid &optional program)
+  (interactive "nProcess ID (pid): ")
+  (unless program
+    (setq program (read-shell-command "Target program (optional): ")))
+  (dapdbg--attach-codelldb pid (if (string-empty-p program) nil program)))
 
 (defun dapdbg-ui-start-gdb (command-line)
   (interactive (list (read-shell-command "Target (command-line): ")))
@@ -258,7 +250,7 @@ accounting for existing breakpoint markers."
   "Major mode for the debugger REPL and process output"
   :interactive nil)
 
-(defun dapdbg-ui--get-repl-buffer ()
+(defun dapdbg-ui--get-interaction-buffer ()
   "Get the main buffer used to interact with the debugger."
   (let* ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--interaction-buffer-name))
          (buf (car buf-created)))
@@ -275,16 +267,15 @@ accounting for existing breakpoint markers."
 
 (defun dapdbg-ui--set-repl-prompt ()
   "Set up the repl prompt using the type of the current session debugger."
-  (with-current-buffer (dapdbg-ui--get-repl-buffer)
+  (with-current-buffer (dapdbg-ui--get-interaction-buffer)
     (overlay-put dapdbg-ui--prompt-olay
                  'before-string (propertize (format "(%s) " (dapdbg-session-type dapdbg--ssn))
-                                            'face 'comint-highlight-prompt))
-    (setq-local mode-name (format "dbg: %s" (dapdbg-session-target-name dapdbg--ssn)))))
+                                            'face 'comint-highlight-prompt))))
 
 (defun dapdbg-ui--output (data &optional category)
   "Output the given data into the repl buffer just before the prompt."
   (when (not (string-empty-p data))
-    (let ((buf (dapdbg-ui--get-repl-buffer)))
+    (let ((buf (dapdbg-ui--get-interaction-buffer)))
       (with-current-buffer buf
         (goto-char (overlay-start dapdbg-ui--prompt-olay))
         (dapdbg-ui--output-at-point data category)
@@ -307,7 +298,7 @@ accounting for existing breakpoint markers."
   "Output a progress indicator into the current buffer. The first
 progess update for ID is inserted into the buffer just before the
 prompt, and subsequent updates are written to the same line."
-  (with-current-buffer (dapdbg-ui--get-repl-buffer)
+  (with-current-buffer (dapdbg-ui--get-interaction-buffer)
     (let ((progress-record (gethash id dapdbg-ui--progress-table))
           (output-mark (overlay-start dapdbg-ui--prompt-olay)))
       (unless progress-record
@@ -652,6 +643,11 @@ PARENT-ID provided in CHILD-LIST."
 
 (defun dapdbg-ui--variables-update (call-stack-id parent-id child-list)
   "Update variables buffer with (partial) tree data"
+  (with-current-buffer dapdbg-ui--variables-buffer-name
+    (setq-local mode-name
+                (format "thread %s [%s]"
+                        (dapdbg-session-thread-id dapdbg--ssn)
+                        (substring call-stack-id 0 (seq-position call-stack-id ?/)))))
   (dapdbg-ui--variables-refresh call-stack-id parent-id child-list
                                 dapdbg-ui--variables-buffer-name))
 
@@ -943,15 +939,19 @@ from the instruction cache around PROGRAM-COUNTER."
                       (format "%s:%d" (file-name-nondirectory filename) linenumber)
                     "")))))
 
-(defun dapdbg-ui--breakpoints-display-update ()
-  "Update the table display in the breakpoints buffer."
+(defun dapdbg-ui--get-breakpoints-buffer ()
   (let ((buf-created (dapdbg--get-or-create-buffer dapdbg-ui--breakpoints-buffer-name)))
     (when (cdr buf-created)
       (with-current-buffer (car buf-created)
         (dapdbg-ui-breakpoints-mode)
         (setq-local buffer-read-only t)
         (font-lock-mode -1)))
-    (with-current-buffer (car buf-created)
+    (car buf-created)))
+
+(defun dapdbg-ui--breakpoints-display-update ()
+  "Update the table display in the breakpoints buffer."
+  (let ((buf (dapdbg-ui--get-breakpoints-buffer)))
+    (with-current-buffer buf
       (setq tabulated-list-entries nil)
       (maphash (lambda (id bp-details)
                  (push (dapdbg-ui--make-breakpoint-line bp-details)
@@ -960,7 +960,7 @@ from the instruction cache around PROGRAM-COUNTER."
       (setq tabulated-list-entries (nreverse tabulated-list-entries))
       (tabulated-list-print)
       (goto-char (point-min))
-      (display-buffer (car buf-created)))))
+      (display-buffer buf))))
 
 (defun dapdbg-ui--set-breakpoint-markers (buf source-table)
   (dapdbg-ui--clear-breakpoint-markers buf)
@@ -976,7 +976,8 @@ from the instruction cache around PROGRAM-COUNTER."
 (defun dapdbg-ui--breakpoint-hit (ids)
   (seq-doseq (id ids)
     (let ((bp-details (gethash id (dapdbg-session-breakpoints dapdbg--ssn))))
-      (cl-incf (gethash "hits" bp-details)))))
+      (when bp-details
+        (cl-incf (gethash "hits" bp-details))))))
 
 (defun dapdbg-ui--refresh-source-breakpoints (filename bp-table)
   (let ((buf (get-file-buffer filename)))
@@ -995,6 +996,13 @@ from the instruction cache around PROGRAM-COUNTER."
 
 (defun dapdbg-ui--handle-process-event (parsed-msg)
   (dapdbg-ui--set-repl-prompt)
+  (let ((name (format "dbg: %s" (dapdbg-session-target-name dapdbg--ssn))))
+    (dolist (buf `(,(dapdbg-ui--get-variables-buffer dapdbg-ui--registers-buffer-name)
+                   ,(dapdbg-ui--get-disassembly-buffer)
+                   ,(dapdbg-ui--get-interaction-buffer)
+                   ,(dapdbg-ui--get-breakpoints-buffer)))
+      (with-current-buffer buf
+        (setq-local mode-name name))))
   (let ((body (gethash "body" parsed-msg)))
     (dapdbg-ui--output (format "# Event: %s %s, pid: %s\n"
                                (gethash "startMethod" body)

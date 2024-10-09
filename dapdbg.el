@@ -95,6 +95,21 @@ version 14 onwards."
   :group 'dapdbg
   :type '(repeat string))
 
+(defconst dapdbg-lldb-get-breakpoints "def getBreakpoints():
+  def listBP(bp, parent_id=None, addr=None):
+    return {'id': str(bp.GetID()) if parent_id is None else f'{parent_id}.{bp.GetID()}',
+            'addr': addr,
+            'cond': bp.GetCondition(),
+            'desc': bp.__repr__(),
+            'hits': bp.GetHitCount()}
+  list = []
+  for bp in lldb.target.breakpoint_iter():
+    list.append(listBP(bp))
+    for loc in bp.locations:
+      list.append(listBP(loc, bp.GetID(), loc.GetAddress().load_addr))
+  import json
+  print(json.dumps( list))
+")
 ;; ------------------- initialization and session ---------------------
 
 (cl-defstruct dapdbg-session
@@ -131,8 +146,7 @@ breakpoints and latest thread/stack state when stopped."
                :coding 'no-conversion
                :command command-line
                :stderr "*debugger stderr*"
-               :filter #'dapdbg--handle-server-message
-               :noquery t))
+               :filter #'dapdbg--handle-server-message))
         (prev-ssn dapdbg--ssn))
     (setq dapdbg--ssn (make-dapdbg-session :process proc :type debugger-type))
     (when prev-ssn
@@ -172,8 +186,7 @@ breakpoints and latest thread/stack state when stopped."
                 :connection-type 'pipe
                 :command (list program "--connect" (int-to-string port))
                 :buffer "*debugger stdout*"
-                :stderr "*debugger stderr*"
-                :noquery t))
+                :stderr "*debugger stderr*"))
     (while (or (not client) (< retries 100))
       (sit-for 0.01)
       (cl-incf retries))
@@ -220,9 +233,11 @@ https://microsoft.github.io/debug-adapter-protocol/overview#initialization."
   "Handle the response to the initialize request, which contains the
 capabilities of the debugger."
   (let ((caps (gethash "body" msg)))
-    (dolist (cap '("supportsConditionalBreakpoints" "supportsConfigurationDoneRequest"))
+    (dolist (cap '("supportsConditionalBreakpoints"
+                   "supportsFunctionBreakpoints"
+                   "supportsConfigurationDoneRequest"))
       (unless (gethash cap caps)
-        (dapdbg-disconnect)
+        (dapdbg-quit)
         (error "Debugger does not have capability \"%s\"" cap)))
     (setf (dapdbg-session-capabilities dapdbg--ssn) caps)))
 
@@ -341,6 +356,23 @@ to resolve breakpoints more quickly."
           pid
           program
           (list :initCommands dapdbg-lldb-init-commands))))
+    (setf (dapdbg-session-target-name dapdbg--ssn) (plist-get attach-args :name))
+    (dapdbg--apply-source-mappings attach-args)
+    (dapdbg--request-initialize
+     (lambda (response)
+       (dapdbg--send-request "attach" attach-args)))))
+
+(defun dapdbg--attach-codelldb (pid &optional program)
+  "Attach the LLDB debugger to an existing process PID. If supplied,
+PROGRAM is the binary for the existing process."
+  (dapdbg--ensure-not-connected)
+  (dapdbg--server-connection dapdbg-codelldb-path dapdbg--codelldb-type)
+  (let ((attach-args
+         (dapdbg--make-attach-request-args
+          dapdbg--codelldb-type
+          pid
+          program
+          (list :initCommands dapdbg-codelldb-init-commands))))
     (setf (dapdbg-session-target-name dapdbg--ssn) (plist-get attach-args :name))
     (dapdbg--apply-source-mappings attach-args)
     (dapdbg--request-initialize
@@ -500,13 +532,15 @@ current buffer."
 (defun dapdbg--update-breakpoint-details (source-table updated-bp)
   (let ((id (gethash "id" updated-bp))
         (table (dapdbg-session-breakpoints dapdbg--ssn)))
-    (if-let ((existing-bp (gethash id table)))
-        (maphash (lambda (key value)
-                   (puthash key value existing-bp))
-                 updated-bp)
-      (puthash "hits" 0 updated-bp)
-      (puthash id updated-bp table)
-      (puthash (gethash "line" updated-bp) id source-table))))
+    (when id
+      (if-let ((existing-bp (gethash id table)))
+          (maphash (lambda (key value)
+                     (puthash key value existing-bp))
+                   updated-bp)
+        (puthash "hits" 0 updated-bp)
+        (puthash id updated-bp table)
+        (if-let ((linenumber (gethash "line" updated-bp)))
+            (puthash linenumber id source-table))))))
 
 (defun dapdbg--update-breakpoint-table (filename bp-response)
   (unless (equal "setBreakpoints" (gethash "command" bp-response))
@@ -715,6 +749,9 @@ call with the result), invoking `dapdbg--send-request' each time."
      (run-hook-with-args 'dapdbg--continued-callback-list parsed-msg))
     ("process"
      (setf (dapdbg-session-target-state dapdbg--ssn) 'running)
+     (let ((target-name (gethash "name" (gethash "body" parsed-msg))))
+       (unless (string-empty-p target-name)
+         (setf (dapdbg-session-target-name dapdbg--ssn) (file-name-nondirectory target-name))))
      (run-hook-with-args 'dapdbg--process-callback-list parsed-msg))
     ("breakpoint"
      (dapdbg--handle-event-breakpoint parsed-msg)
